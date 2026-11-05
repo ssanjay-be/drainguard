@@ -7,7 +7,7 @@
 // ============================================================
 
 window.APP_CONFIG = {
-  API_BASE_URL: 'http://localhost:3001', // Change this for production
+  API_BASE_URL: 'https://drainguard-by4m.onrender.com', // Your deployed Render backend
   POLL_INTERVAL_MS: 5000,               // How often the overview tab polls for new data
   IST_TIMEZONE: 'Asia/Kolkata'           // All times shown in Indian Standard Time
 };
