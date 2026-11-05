@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0">
+  <title>DrainGuard - Predictive Drain Clog Diagnostic</title>
+
+  <!-- Favicon using SVG Cloud with Rain -->
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌧️</text></svg>">
+
+  <!-- Application Stylesheet -->
+  <link rel="stylesheet" href="style.css">
+
+  <!-- Leaflet Map CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+
+  <!-- Chart.js and Extensions CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+
+  <!-- Leaflet Map JS CDN -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+</head>
+<body>
+
+  <!-- ─── 1. Header Bar ───────────────────────────────────────── -->
+  <header class="app-header">
+    <div class="header-container">
+      <!-- Brand & Title -->
+      <div class="brand-wrapper">
+        <span class="brand-logo" aria-hidden="true">🌧️</span>
+        <div>
+          <h1 class="brand-title">DrainGuard</h1>
+          <span class="brand-subtitle">Predictive Stormwater Clog Diagnostic</span>
+        </div>
+      </div>
+
+      <!-- Controls & Status -->
+      <div class="header-controls">
+        <!-- Device Selector -->
+        <div class="device-select-wrapper" title="Select monitored drain unit">
+          <label for="device-select" class="device-select-label">Device:</label>
+          <select id="device-select" class="device-select" aria-label="Select device">
+            <option value="">Loading devices...</option>
+          </select>
+        </div>
+
+        <!-- Online Status Indicator -->
+        <div class="online-status-pill" title="Heartbeat telemetry status">
+          <span id="online-dot" class="online-dot offline"></span>
+          <span id="last-seen-text">Checking...</span>
+        </div>
+
+        <!-- Theme Toggle (Light / Dark) -->
+        <button id="theme-toggle" class="btn-icon" aria-label="Toggle light or dark theme" title="Toggle theme">
+          <span id="theme-icon">☀️</span>
+        </button>
+
+        <!-- Admin Mode Button / Lock -->
+        <button id="admin-lock-btn" class="btn-icon" aria-label="Admin settings mode" title="Admin lock (Click to unlock)">
+          <span id="admin-icon">🔒</span>
+          <span id="admin-badge" class="badge">Read-only</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- ─── 2. Sticky Critical Alert Banner ─────────────────────── -->
+  <div id="alert-banner" hidden role="alert" aria-live="assertive">
+    <div class="alert-banner-content">
+      <span>🚨</span>
+      <span id="alert-banner-text">Critical clog or flood alert active on selected drain!</span>
+    </div>
+    <button id="alert-banner-action" class="alert-banner-btn">View Alerts</button>
+  </div>
+
+  <!-- ─── 3. Cold-Start Server Wakeup Message ─────────────────── -->
+  <div id="cold-start-msg" role="status">
+    <span class="spinner" aria-hidden="true"></span>
+    <span>Waking up the server... this can take up to 60 seconds on free cloud hosting.</span>
+  </div>
+
+  <!-- ─── 4. Navigation Tab Bar ───────────────────────────────── -->
+  <nav class="tabs-nav-bar" aria-label="Main Navigation">
+    <div class="tabs-container" role="tablist">
+      <button class="tab-btn active" data-tab="overview" role="tab" aria-selected="true" id="tab-btn-overview">
+        <span>📊</span> Overview
+      </button>
+      <button class="tab-btn" data-tab="analytics" role="tab" aria-selected="false" id="tab-btn-analytics">
+        <span>📈</span> Analytics
+      </button>
+      <button class="tab-btn" data-tab="trends" role="tab" aria-selected="false" id="tab-btn-trends">
+        <span>📉</span> Trends
+      </button>
+      <button class="tab-btn" data-tab="history" role="tab" aria-selected="false" id="tab-btn-history">
+        <span>📜</span> History
+      </button>
+      <button class="tab-btn" data-tab="alerts" role="tab" aria-selected="false" id="tab-btn-alerts">
+        <span>🔔</span> Alerts
+      </button>
+      <button class="tab-btn" data-tab="settings" role="tab" aria-selected="false" id="tab-btn-settings">
+        <span>⚙️</span> Settings
+      </button>
+    </div>
+  </nav>
+
+  <!-- ─── 5. Tab Panels Container ─────────────────────────────── -->
+  <main class="main-content">
+    
+    <!-- Tab 1: Overview -->
+    <div class="tab-panel active" id="tab-overview" role="tabpanel" aria-labelledby="tab-btn-overview">
+      <div class="skeleton-loader">Loading Overview telemetry...</div>
+    </div>
+
+    <!-- Tab 2: Analytics -->
+    <div class="tab-panel" id="tab-analytics" role="tabpanel" aria-labelledby="tab-btn-analytics">
+      <div class="skeleton-loader">Loading Analytics reports...</div>
+    </div>
+
+    <!-- Tab 3: Trends -->
+    <div class="tab-panel" id="tab-trends" role="tabpanel" aria-labelledby="tab-btn-trends">
+      <div class="skeleton-loader">Loading Trends analysis...</div>
+    </div>
+
+    <!-- Tab 4: History -->
+    <div class="tab-panel" id="tab-history" role="tabpanel" aria-labelledby="tab-btn-history">
+      <div class="skeleton-loader">Loading History logs...</div>
+    </div>
+
+    <!-- Tab 5: Alerts -->
+    <div class="tab-panel" id="tab-alerts" role="tabpanel" aria-labelledby="tab-btn-alerts">
+      <div class="skeleton-loader">Loading System alerts...</div>
+    </div>
+
+    <!-- Tab 6: Settings -->
+    <div class="tab-panel" id="tab-settings" role="tabpanel" aria-labelledby="tab-btn-settings">
+      <div class="skeleton-loader">Loading Device settings...</div>
+    </div>
+
+  </main>
+
+  <!-- ─── 6. Footer ───────────────────────────────────────────── -->
+  <footer class="app-footer">
+    <p>Built for Greater Chennai Corporation use case | DrainGuard v1.0</p>
+  </footer>
+
+  <!-- ─── 7. Toast Container ──────────────────────────────────── -->
+  <div id="toast-container" aria-live="polite" aria-atomic="true"></div>
+
+  <!-- ─── 8. Admin Password Modal ─────────────────────────────── -->
+  <div id="admin-modal" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="admin-modal-title">
+      <h2 id="admin-modal-title" style="margin-bottom: 0.5rem; font-size: 1.15rem;">Admin Authentication</h2>
+      <p style="font-size: 0.85rem; color: var(--text-secondary); margin-bottom: 1rem;">
+        Enter the system administrator key to configure device thresholds, trigger calibration, and resolve critical alerts.
+      </p>
+      <form id="admin-form">
+        <div class="form-group">
+          <label for="admin-password-input" class="form-label">Admin Password</label>
+          <input type="password" id="admin-password-input" class="form-control" placeholder="••••••••••••" required autocomplete="current-password">
+        </div>
+        <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;">
+          <button type="button" id="admin-cancel-btn" class="btn btn-secondary">Cancel</button>
+          <button type="submit" id="admin-submit-btn" class="btn btn-primary">Unlock</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ─── 9. History Detail Slide-in Drawer ───────────────────── -->
+  <div id="history-drawer-backdrop" class="drawer-backdrop" aria-hidden="true">
+    <div class="drawer" id="history-drawer" role="dialog" aria-modal="true">
+      <div class="drawer-header">
+        <h3 class="drawer-title" id="drawer-event-title">Drain Event Details</h3>
+        <button id="drawer-close-btn" class="btn-icon" aria-label="Close drawer">✕</button>
+      </div>
+      <div id="drawer-content">
+        <!-- Rendered dynamically by JS -->
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── 10. Application Scripts ─────────────────────────────── -->
+  <!-- Configuration FIRST -->
+  <script src="config.js"></script>
+  <!-- API Client Service SECOND -->
+  <script src="api.js"></script>
+  <!-- Main Application Logic THIRD -->
+  <script src="app.js"></script>
+
+</body>
+</html>
