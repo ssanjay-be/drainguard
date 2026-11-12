@@ -125,7 +125,7 @@ async function upsertDevice(deviceId) {
     .from('devices')
     .select('id')
     .eq('id', deviceId)
-    .single();
+    .maybeSingle();
 
   if (existing) {
     // Device exists — just update last_seen
@@ -134,21 +134,22 @@ async function upsertDevice(deviceId) {
       .update({ last_seen: now })
       .eq('id', deviceId);
   } else {
-    // New device — create it with defaults
+    // New device — create it with clean defaults
     await supabase.from('devices').insert({
       id:        deviceId,
-      name:      `Device ${deviceId}`,
+      name:      `DrainGuard Unit (${deviceId})`,
+      location:  'Active Field Site',
       last_seen: now,
     });
 
     // Also create default device_config row for it
     await supabase.from('device_config').insert({
       device_id:          deviceId,
-      baseline_rod:       null,
+      baseline_rod:       0,
       calibrate:          false,
-      clear_ratio:        0.75,
+      clear_ratio:        0.80,
       preclog_ratio:      0.50,
-      offline_after_min:  10,
+      offline_after_min:  15,
     });
   }
 }
@@ -234,21 +235,19 @@ router.post('/ingest', requireDeviceKey, deviceIngestLimiter, async (req, res, n
       // (too little water to start, or test ended too quickly)
       const lowConfidence = (data.h1_cm < 10 || data.duration_s < 30);
 
-      // Insert the rod_event record
+      // Insert the rod_event record (matching exact rod_events schema columns)
       const { error: insertError } = await supabase
         .from('rod_events')
         .insert({
-          device_id:    data.device_id,
-          state:        data.state,
-          h1_cm:        data.h1_cm,
-          h2_cm:        data.h2_cm,
-          duration_s:   data.duration_s,
-          rod_cm_min:   data.rod_cm_min,
-          baseline_rod: data.baseline_rod,
-          ratio:        data.ratio,
-          status:       data.status,
-          calibration:  data.calibration,
-          rssi:         data.rssi ?? null,
+          device_id:      data.device_id,
+          h1_cm:          data.h1_cm,
+          h2_cm:          data.h2_cm,
+          duration_s:     data.duration_s,
+          rod_cm_min:     data.rod_cm_min,
+          baseline_rod:   data.baseline_rod,
+          ratio:          data.ratio,
+          status:         data.status,
+          calibration:    data.calibration,
           low_confidence: lowConfidence,
         });
 

@@ -1639,23 +1639,75 @@
     const container = document.getElementById('tab-analytics');
     if (!container) return;
 
-    showSkeleton('tab-analytics', 'Computing hydraulic analytics & drop aggregations...');
+    showSkeleton('tab-analytics', 'Computing hydraulic analytics & telemetry aggregations...');
 
     try {
-      const [summary, rodEvents] = await Promise.all([
+      const periodStart = new Date(Date.now() - state.analyticsDays * 24 * 60 * 60 * 1000).toISOString();
+      const [summary, rodEvents, readingsRes] = await Promise.all([
         API.getAnalyticsSummary(state.currentDeviceId, state.analyticsDays),
-        API.getRodEvents({ device_id: state.currentDeviceId, pageSize: 100, limit: 100 })
+        API.getRodEvents({ device_id: state.currentDeviceId, from: periodStart, pageSize: 100, limit: 100 }).catch(() => ({ data: [] })),
+        API.getReadings({ device_id: state.currentDeviceId, from: periodStart, pageSize: 300, limit: 300 }).catch(() => ({ data: [] }))
       ]);
 
       const eventsList = Array.isArray(rodEvents) ? rodEvents : (rodEvents.data || rodEvents.events || []);
       const eventsSummary = summary || {};
+      const derivedEvents = Array.isArray(eventsSummary.derived_events) ? eventsSummary.derived_events : [];
+      const effectiveEvents = eventsList.length > 0 ? eventsList : derivedEvents;
+
+      const rawList = Array.isArray(readingsRes) ? readingsRes : (readingsRes.data || readingsRes.readings || []);
+      const rawReadings = [...rawList].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+      const hasEvents = effectiveEvents.length > 0;
+      const totalReadings = eventsSummary.total_readings !== undefined ? eventsSummary.total_readings : rawReadings.length;
+      const avgWater = eventsSummary.avg_water_cm !== null && eventsSummary.avg_water_cm !== undefined
+        ? Number(eventsSummary.avg_water_cm)
+        : (rawReadings.length > 0 ? rawReadings.reduce((s, r) => s + (Number(r.water_cm) || 0), 0) / rawReadings.length : 0);
+      const peakWater = eventsSummary.peak_water_cm !== null && eventsSummary.peak_water_cm !== undefined
+        ? Number(eventsSummary.peak_water_cm)
+        : (rawReadings.length > 0 ? Math.max(...rawReadings.map(r => Number(r.water_cm) || 0)) : 0);
+      const floodRiskCount = eventsSummary.flood_risk_count !== undefined
+        ? Number(eventsSummary.flood_risk_count)
+        : rawReadings.filter(r => r.flood_risk).length;
+
+      const statusCounts = eventsSummary.status_counts || {};
+      const clearCount = statusCounts.CLEAR !== undefined
+        ? statusCounts.CLEAR
+        : effectiveEvents.filter(e => String(e.status).toUpperCase() === 'CLEAR').length;
+      const alertEventCount = (statusCounts.WATCH || 0) + (statusCounts.PRE_CLOG || 0) ||
+        effectiveEvents.filter(e => ['WATCH', 'PRE_CLOG'].includes(String(e.status).toUpperCase())).length;
+      const avgRodVal = eventsSummary.avg_rod !== null && eventsSummary.avg_rod !== undefined
+        ? Number(eventsSummary.avg_rod).toFixed(2)
+        : calculateAvgRod(effectiveEvents);
+
+      const sourceBadgeText = eventsList.length > 0
+        ? `${eventsList.length} Hardware Events + ${totalReadings} Readings`
+        : (derivedEvents.length > 0
+          ? `${derivedEvents.length} Derived Drain Cycles + ${totalReadings} Readings`
+          : `${totalReadings} Sensor Readings Active`);
+
+      const chartATitle = hasEvents ? '(a) Rate of Drop per Drain Cycle' : '(a) Water Depth Profile Over Time';
+      const chartASubtitle = hasEvents
+        ? (eventsList.length > 0 ? 'Coloured by Diagnostic Status' : 'Derived from Sensor Drop Sequences')
+        : 'Bucketed Mean & Peak Water Depth (cm)';
+
+      const chartBTitle = hasEvents ? '(b) Status Breakdown' : '(b) Telemetry State Breakdown';
+      const chartBSubtitle = hasEvents ? 'Event Ratio Distribution' : 'Sensor FSM State Distribution';
+
+      const chartDTitle = hasEvents ? '(d) Initial Depth (H1) vs RoD Correlation' : '(d) Water Depth vs Sensor Distance';
+      const chartDSubtitle = hasEvents ? 'Hydraulic Head Pressure Effect' : 'Live Ultrasonic Calibration Scatter';
+
+      const chartETitle = hasEvents ? '(e) Rain Events Timeline' : '(e) Telemetry Volume Timeline';
+      const chartESubtitle = hasEvents ? 'Storm Cycle Frequency' : 'Captured Sensor Readings per Day';
 
       container.innerHTML = `
         <!-- Header with Date Range Chips & Print Action -->
         <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.25rem;">
           <div>
-            <h2 style="font-size: 1.3rem; font-weight: 800;">Hydraulic Diagnostic Analytics</h2>
-            <p style="font-size: 0.85rem; color: var(--text-secondary);">Long-term rate of drop metrics and clog detection patterns</p>
+            <div style="display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;">
+              <h2 style="font-size: 1.3rem; font-weight: 800;">Hydraulic Diagnostic Analytics</h2>
+              <span class="badge badge-info" style="font-size: 0.72rem;">📡 ${escapeHTML(sourceBadgeText)}</span>
+            </div>
+            <p style="font-size: 0.85rem; color: var(--text-secondary);">Long-term rate of drop metrics, telemetry hydrology &amp; clog detection patterns</p>
           </div>
           
           <div style="display: flex; align-items: center; gap: 0.5rem;" class="no-print">
@@ -1674,43 +1726,49 @@
         <!-- KPI Cards Grid -->
         <div class="kpi-grid">
           <div class="kpi-card">
-            <span class="kpi-title">Total Drain Events</span>
-            <span class="kpi-value">${eventsSummary.total_rain_events !== undefined ? eventsSummary.total_rain_events : (eventsSummary.total_events || eventsList.length || 0)}</span>
-            <span class="kpi-subtext">Monitored rain cycles</span>
+            <span class="kpi-title">${hasEvents ? 'Total Drain Events' : 'Telemetry Samples'}</span>
+            <span class="kpi-value">${hasEvents ? (eventsSummary.total_rain_events || effectiveEvents.length) : totalReadings}</span>
+            <span class="kpi-subtext">${hasEvents ? (eventsList.length > 0 ? `Hardware cycles (${totalReadings} pts)` : `Derived from ${totalReadings} readings`) : `Captured packets (${state.analyticsDays}d)`}</span>
           </div>
           <div class="kpi-card">
-            <span class="kpi-title">Clear Drainage Rate</span>
-            <span class="kpi-value" style="color: var(--color-clear);">
-              ${eventsSummary.status_counts ? Math.round(((eventsSummary.status_counts.CLEAR || 0) / Math.max(1, eventsSummary.total_rain_events || eventsList.length)) * 100) + '%' : (eventsSummary.clear_percent !== undefined ? eventsSummary.clear_percent + '%' : calculateClearPercent(eventsList))}
+            <span class="kpi-title">${hasEvents ? 'Clear Drainage Rate' : 'Peak Water Depth'}</span>
+            <span class="kpi-value" style="color: ${hasEvents ? 'var(--color-clear)' : 'var(--accent-primary)'};">
+              ${hasEvents
+                ? Math.round((clearCount / Math.max(1, eventsSummary.total_rain_events || effectiveEvents.length)) * 100) + '%'
+                : `${peakWater.toFixed(1)} <span style="font-size: 0.9rem;">cm</span>`}
             </span>
-            <span class="kpi-subtext">Met healthy benchmark</span>
+            <span class="kpi-subtext">${hasEvents ? `Peak depth ${peakWater.toFixed(1)} cm` : `Max recorded depth (${state.analyticsDays}d)`}</span>
           </div>
           <div class="kpi-card">
-            <span class="kpi-title">Average Rate of Drop</span>
-            <span class="kpi-value">${eventsSummary.avg_rod !== null && eventsSummary.avg_rod !== undefined ? Number(eventsSummary.avg_rod).toFixed(2) : (eventsSummary.avg_rod_cm_min !== undefined ? eventsSummary.avg_rod_cm_min : calculateAvgRod(eventsList))} <span style="font-size: 0.9rem;">cm/min</span></span>
-            <span class="kpi-subtext">Across past ${state.analyticsDays} days</span>
+            <span class="kpi-title">${hasEvents ? 'Average Rate of Drop' : 'Mean Water Depth'}</span>
+            <span class="kpi-value">
+              ${hasEvents
+                ? `${avgRodVal} <span style="font-size: 0.9rem;">cm/min</span>`
+                : `${avgWater.toFixed(1)} <span style="font-size: 0.9rem;">cm</span>`}
+            </span>
+            <span class="kpi-subtext">${hasEvents ? `Mean depth ${avgWater.toFixed(1)} cm` : `Baseline sensor level (${state.analyticsDays}d)`}</span>
           </div>
           <div class="kpi-card">
-            <span class="kpi-title">Alerts Raised</span>
-            <span class="kpi-value" style="color: var(--color-preclog);">${eventsSummary.status_counts ? (eventsSummary.status_counts.WATCH || 0) + (eventsSummary.status_counts.PRE_CLOG || 0) : (eventsSummary.total_alerts || 0)}</span>
-            <span class="kpi-subtext">Watch & pre-clog events</span>
+            <span class="kpi-title">Alerts &amp; Flood Flags</span>
+            <span class="kpi-value" style="color: ${(alertEventCount + floodRiskCount) > 0 ? 'var(--color-preclog)' : 'var(--color-clear)'};">${hasEvents ? alertEventCount : floodRiskCount}</span>
+            <span class="kpi-subtext">${hasEvents ? `Watch/pre-clog + ${floodRiskCount} flood flags` : 'High-water flood risk readings'}</span>
           </div>
         </div>
 
         <!-- Month over Month Comparison Card -->
         <div class="card" style="margin-bottom: 1.25rem;">
           <div class="card-header">
-            <h3 class="card-title"><span>📅</span> Month-Over-Month Drainage Velocity Trend</h3>
+            <h3 class="card-title"><span>📅</span> ${hasEvents ? 'Period-Over-Period Drainage Velocity Trend' : 'Period-Over-Period Water Depth Comparison'}</h3>
           </div>
-          ${renderMoMComparisonHTML(eventsSummary, eventsList)}
+          ${renderMoMComparisonHTML(eventsSummary, effectiveEvents, rawReadings)}
         </div>
 
-        <!-- Analytics Charts Grid: (a) RoD Bar Chart & (b) Doughnut Distribution -->
+        <!-- Analytics Charts Grid: (a) RoD / Water Depth Bar Chart & (b) Doughnut Distribution -->
         <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 1.25rem; margin-bottom: 1.25rem;">
           <div class="card">
             <div class="card-header">
-              <h3 class="card-title"><span>📊</span> (a) Rate of Drop per Rain Event</h3>
-              <span class="card-subtitle">Coloured by Diagnostic Status</span>
+              <h3 class="card-title"><span>📊</span> ${chartATitle}</h3>
+              <span class="card-subtitle">${chartASubtitle}</span>
             </div>
             <div class="chart-container">
               <canvas id="chart-analytics-rod"></canvas>
@@ -1719,8 +1777,8 @@
 
           <div class="card">
             <div class="card-header">
-              <h3 class="card-title"><span>🍩</span> (b) Status Breakdown</h3>
-              <span class="card-subtitle">Event Ratio Distribution</span>
+              <h3 class="card-title"><span>🍩</span> ${chartBTitle}</h3>
+              <span class="card-subtitle">${chartBSubtitle}</span>
             </div>
             <div class="chart-container">
               <canvas id="chart-analytics-doughnut"></canvas>
@@ -1728,12 +1786,12 @@
           </div>
         </div>
 
-        <!-- Additional Charts Grid: (d) Scatter Plot & (e) Rain Events Per Week -->
+        <!-- Additional Charts Grid: (d) Scatter Plot & (e) Timeline Grouping -->
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem;">
           <div class="card">
             <div class="card-header">
-              <h3 class="card-title"><span>🎯</span> (d) Initial Depth (H1) vs RoD Correlation</h3>
-              <span class="card-subtitle">Hydraulic Head Pressure Effect</span>
+              <h3 class="card-title"><span>🎯</span> ${chartDTitle}</h3>
+              <span class="card-subtitle">${chartDSubtitle}</span>
             </div>
             <div class="chart-container">
               <canvas id="chart-analytics-scatter"></canvas>
@@ -1742,8 +1800,8 @@
 
           <div class="card">
             <div class="card-header">
-              <h3 class="card-title"><span>🌧️</span> (e) Rain Events per ISO Week</h3>
-              <span class="card-subtitle">Storm Frequency Grouping</span>
+              <h3 class="card-title"><span>🌧️</span> ${chartETitle}</h3>
+              <span class="card-subtitle">${chartESubtitle}</span>
             </div>
             <div class="chart-container">
               <canvas id="chart-analytics-weekly"></canvas>
@@ -1766,11 +1824,11 @@
         printBtn.addEventListener('click', () => window.print());
       }
 
-      // Initialize all 4 charts
-      initAnalyticsRodChart(eventsList);
-      initAnalyticsDoughnutChart(eventsList);
-      initAnalyticsScatterChart(eventsList);
-      initAnalyticsWeeklyChart(eventsList);
+      // Initialize all 4 charts (with full readings fallback + live event support)
+      initAnalyticsRodChart(effectiveEvents, rawReadings);
+      initAnalyticsDoughnutChart(effectiveEvents, eventsSummary, rawReadings);
+      initAnalyticsScatterChart(effectiveEvents, rawReadings);
+      initAnalyticsWeeklyChart(effectiveEvents, rawReadings);
 
     } catch (err) {
       console.error('[Analytics] Render failed:', err);
@@ -1791,94 +1849,198 @@
   }
 
   /**
-   * Component (c): Month-over-month card with change arrow
+   * Component (c): Period-over-period comparison card driven by real events or readings
    */
-  function renderMoMComparisonHTML(summary, events) {
-    const momChange = summary.month_over_month && summary.month_over_month.change_pct !== null && summary.month_over_month.change_pct !== undefined
-      ? summary.month_over_month.change_pct
-      : summary.mom_change_percent;
-    const pctChange = momChange !== undefined && momChange !== null ? Number(momChange).toFixed(1) : -8.5;
-    const isDecline = pctChange < 0;
-    const arrow = isDecline ? '↓' : '↑';
-    const color = isDecline ? 'var(--color-watch)' : 'var(--color-clear)';
+  function renderMoMComparisonHTML(summary, events, rawReadings) {
+    const mom = summary.month_over_month || {};
+    const hasRodChange = mom.change_pct !== null && mom.change_pct !== undefined;
+    const hasWaterChange = mom.water_change_pct !== null && mom.water_change_pct !== undefined;
+
+    if (hasRodChange) {
+      const pctChange = Number(mom.change_pct).toFixed(1);
+      const isDecline = Number(pctChange) < 0;
+      const arrow = isDecline ? '↓' : (Number(pctChange) > 0 ? '↑' : '→');
+      const color = isDecline ? 'var(--color-watch)' : 'var(--color-clear)';
+      return `
+        <div style="display: flex; align-items: center; gap: 1.5rem; flex-wrap: wrap;">
+          <div style="display: flex; align-items: baseline; gap: 0.4rem;">
+            <span style="font-size: 2.2rem; font-weight: 800; color: ${color};">${arrow} ${Math.abs(pctChange)}%</span>
+            <span style="font-size: 0.85rem; color: var(--text-secondary);">RoD vs previous window</span>
+          </div>
+          <p style="font-size: 0.85rem; color: var(--text-secondary); flex: 1; min-width: 260px;">
+            ${isDecline
+              ? 'Drainage velocity shows a downward shift vs the prior interval. Monitor for silt sedimentation or inlet obstruction.'
+              : 'Drainage velocity is stable or improving vs the prior interval under observed rainfall loads.'}
+          </p>
+        </div>
+      `;
+    }
+
+    if (hasWaterChange) {
+      const pctChange = Number(mom.water_change_pct).toFixed(1);
+      const isRising = Number(pctChange) > 5;
+      const arrow = Number(pctChange) > 0 ? '↑' : (Number(pctChange) < 0 ? '↓' : '→');
+      const color = isRising ? 'var(--color-watch)' : 'var(--color-clear)';
+      return `
+        <div style="display: flex; align-items: center; gap: 1.5rem; flex-wrap: wrap;">
+          <div style="display: flex; align-items: baseline; gap: 0.4rem;">
+            <span style="font-size: 2.2rem; font-weight: 800; color: ${color};">${arrow} ${Math.abs(pctChange)}%</span>
+            <span style="font-size: 0.85rem; color: var(--text-secondary);">mean water depth vs previous 30d</span>
+          </div>
+          <p style="font-size: 0.85rem; color: var(--text-secondary); flex: 1; min-width: 260px;">
+            ${isRising
+              ? 'Average water depth increased relative to the previous 30-day window. Continue monitoring drainage recovery.'
+              : 'Water depth remains controlled compared to the previous 30-day baseline. Telemetry is ready to log RoD when rainfall cycles occur.'}
+          </p>
+        </div>
+      `;
+    }
+
+    // Single-window fallback computed from current telemetry readings/events
+    const avgWater = summary.avg_water_cm !== null && summary.avg_water_cm !== undefined
+      ? Number(summary.avg_water_cm).toFixed(1)
+      : (rawReadings && rawReadings.length > 0
+        ? (rawReadings.reduce((s, r) => s + (Number(r.water_cm) || 0), 0) / rawReadings.length).toFixed(1)
+        : '0.0');
+    const count = summary.total_readings !== undefined ? summary.total_readings : (rawReadings ? rawReadings.length : 0);
 
     return `
       <div style="display: flex; align-items: center; gap: 1.5rem; flex-wrap: wrap;">
         <div style="display: flex; align-items: baseline; gap: 0.4rem;">
-          <span style="font-size: 2.2rem; font-weight: 800; color: ${color};">${arrow} ${Math.abs(pctChange)}%</span>
-          <span style="font-size: 0.85rem; color: var(--text-secondary);">vs previous 30-day baseline</span>
+          <span style="font-size: 2.0rem; font-weight: 800; color: var(--accent-primary);">${avgWater} cm</span>
+          <span style="font-size: 0.85rem; color: var(--text-secondary);">current window baseline (${count} samples)</span>
         </div>
         <p style="font-size: 0.85rem; color: var(--text-secondary); flex: 1; min-width: 260px;">
-          ${isDecline 
-            ? 'Drainage velocity shows a gradual downward shift. Indicates silt sedimentation or leaf litter entrapment along the culvert mouth.' 
-            : 'Drainage velocity is stable or improving. Pipe cross-section is self-clearing under current rainfall loads.'}
+          ${events && events.length > 0
+            ? 'Initial drain cycle baseline captured. Period-over-period % comparison will activate once a second multi-week comparison window exists.'
+            : 'Collecting continuous telemetry in current window. Period-over-period RoD delta will unlock automatically as rain/drop cycles accumulate across periods.'}
         </p>
       </div>
     `;
   }
 
   /**
-   * Chart (a): RoD per event bar chart with dashed benchmark lines
+   * Chart (a): RoD per event bar chart (or bucketed water depth bar chart when no drain cycles exist yet)
    */
-  function initAnalyticsRodChart(events) {
+  function initAnalyticsRodChart(events, rawReadings) {
     const canvas = document.getElementById('chart-analytics-rod');
     if (!canvas) return;
     destroyChart('analyticsRod');
 
-    const sorted = [...events].sort((a, b) => new Date(a.created_at) - new Date(b.created_at)).slice(-25);
-    const labels = sorted.map(e => formatShortIST(e.created_at));
-    const rodValues = sorted.map(e => Number(e.rod_cm_min) || 0);
-
-    const colors = sorted.map(e => {
-      const s = String(e.status).toUpperCase();
-      if (s === 'CLEAR') return '#22c55e';
-      if (s === 'WATCH') return '#f59e0b';
-      if (s === 'PRE_CLOG') return '#ef4444';
-      return '#3b82f6';
-    });
-
-    const baselineVal = sorted.length > 0 && sorted[0].baseline_rod ? Number(sorted[0].baseline_rod) : 2.5;
-
     const ctx = canvas.getContext('2d');
+
+    if (events && events.length > 0) {
+      const sorted = [...events].sort((a, b) => new Date(a.created_at) - new Date(b.created_at)).slice(-25);
+      const labels = sorted.map(e => formatShortIST(e.created_at));
+      const rodValues = sorted.map(e => Number(e.rod_cm_min) || 0);
+
+      const colors = sorted.map(e => {
+        const s = String(e.status).toUpperCase();
+        if (s === 'CLEAR') return '#22c55e';
+        if (s === 'WATCH') return '#f59e0b';
+        if (s === 'PRE_CLOG') return '#ef4444';
+        return '#3b82f6';
+      });
+
+      const validBaselines = sorted.map(e => Number(e.baseline_rod) || 0).filter(v => v > 0);
+      const baselineVal = validBaselines.length > 0 ? validBaselines[0] : (Math.max(...rodValues, 1) * 1.1);
+
+      chartRegistry['analyticsRod'] = new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels,
+          datasets: [
+            {
+              label: 'Measured RoD (cm/min)',
+              data: rodValues,
+              backgroundColor: colors,
+              borderRadius: 4
+            },
+            {
+              label: 'Baseline (100%)',
+              data: labels.map(() => baselineVal),
+              type: 'line',
+              borderColor: '#3b82f6',
+              borderDash: [5, 5],
+              borderWidth: 2,
+              pointRadius: 0,
+              fill: false
+            },
+            {
+              label: 'Watch (80%)',
+              data: labels.map(() => baselineVal * 0.8),
+              type: 'line',
+              borderColor: '#f59e0b',
+              borderDash: [3, 3],
+              borderWidth: 1.5,
+              pointRadius: 0,
+              fill: false
+            },
+            {
+              label: 'Pre-Clog (50%)',
+              data: labels.map(() => baselineVal * 0.5),
+              type: 'line',
+              borderColor: '#ef4444',
+              borderDash: [3, 3],
+              borderWidth: 1.5,
+              pointRadius: 0,
+              fill: false
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { position: 'top', labels: { boxWidth: 12, font: { size: 10 } } }
+          },
+          scales: {
+            y: { beginAtZero: true, title: { display: true, text: 'RoD (cm/min)' } },
+            x: { title: { display: true, text: 'Event Timestamp (IST)' } }
+          }
+        }
+      });
+      return;
+    }
+
+    // Fallback: bucket raw readings into ~16 chronological intervals showing Mean & Peak Water Depth
+    const readings = rawReadings || [];
+    const buckets = [];
+    if (readings.length > 0) {
+      const targetBuckets = Math.min(16, readings.length);
+      const chunkSize = Math.ceil(readings.length / targetBuckets);
+      for (let i = 0; i < readings.length; i += chunkSize) {
+        const slice = readings.slice(i, i + chunkSize);
+        const avg = slice.reduce((s, r) => s + (Number(r.water_cm) || 0), 0) / slice.length;
+        const max = Math.max(...slice.map(r => Number(r.water_cm) || 0));
+        buckets.push({
+          label: formatShortIST(slice[slice.length - 1].created_at),
+          avg: Number(avg.toFixed(2)),
+          max: Number(max.toFixed(2)),
+          floodRisk: slice.some(r => r.flood_risk)
+        });
+      }
+    }
+
     chartRegistry['analyticsRod'] = new Chart(ctx, {
       type: 'bar',
       data: {
-        labels: labels.length > 0 ? labels : ['No Data'],
+        labels: buckets.length > 0 ? buckets.map(b => b.label) : ['No Telemetry'],
         datasets: [
           {
-            label: 'Measured RoD (cm/min)',
-            data: rodValues.length > 0 ? rodValues : [0],
-            backgroundColor: colors,
+            label: 'Mean Water Depth (cm)',
+            data: buckets.length > 0 ? buckets.map(b => b.avg) : [0],
+            backgroundColor: buckets.map(b => b.floodRisk ? '#ef4444' : '#ffd60a'),
             borderRadius: 4
           },
           {
-            label: 'Baseline (100%)',
-            data: labels.map(() => baselineVal),
+            label: 'Peak Depth (cm)',
+            data: buckets.length > 0 ? buckets.map(b => b.max) : [0],
             type: 'line',
-            borderColor: '#3b82f6',
-            borderDash: [5, 5],
+            borderColor: '#38bdf8',
             borderWidth: 2,
-            pointRadius: 0,
-            fill: false
-          },
-          {
-            label: 'Watch (80%)',
-            data: labels.map(() => baselineVal * 0.8),
-            type: 'line',
-            borderColor: '#f59e0b',
-            borderDash: [3, 3],
-            borderWidth: 1.5,
-            pointRadius: 0,
-            fill: false
-          },
-          {
-            label: 'Pre-Clog (50%)',
-            data: labels.map(() => baselineVal * 0.5),
-            type: 'line',
-            borderColor: '#ef4444',
-            borderDash: [3, 3],
-            borderWidth: 1.5,
-            pointRadius: 0,
+            pointRadius: 2,
+            tension: 0.3,
             fill: false
           }
         ]
@@ -1890,42 +2052,83 @@
           legend: { position: 'top', labels: { boxWidth: 12, font: { size: 10 } } }
         },
         scales: {
-          y: { beginAtZero: true, title: { display: true, text: 'RoD (cm/min)' } },
-          x: { title: { display: true, text: 'Event Timestamp' } }
+          y: { beginAtZero: true, title: { display: true, text: 'Water Depth (cm)' } },
+          x: { title: { display: true, text: 'Telemetry Window (IST)' } }
         }
       }
     });
   }
 
   /**
-   * Chart (b): Status distribution doughnut
+   * Chart (b): Status distribution doughnut (events) OR Sensor FSM State doughnut (readings)
    */
-  function initAnalyticsDoughnutChart(events) {
+  function initAnalyticsDoughnutChart(events, summary, rawReadings) {
     const canvas = document.getElementById('chart-analytics-doughnut');
     if (!canvas) return;
     destroyChart('analyticsDoughnut');
 
-    let clearCount = 0;
-    let watchCount = 0;
-    let preclogCount = 0;
-    let calibratedCount = 0;
-
-    events.forEach(e => {
-      const s = String(e.status).toUpperCase();
-      if (s === 'CLEAR') clearCount++;
-      else if (s === 'WATCH') watchCount++;
-      else if (s === 'PRE_CLOG') preclogCount++;
-      else if (s === 'CALIBRATED') calibratedCount++;
-    });
-
     const ctx = canvas.getContext('2d');
+
+    if (events && events.length > 0) {
+      let clearCount = 0;
+      let watchCount = 0;
+      let preclogCount = 0;
+      let calibratedCount = 0;
+
+      events.forEach(e => {
+        const s = String(e.status).toUpperCase();
+        if (s === 'CLEAR') clearCount++;
+        else if (s === 'WATCH') watchCount++;
+        else if (s === 'PRE_CLOG') preclogCount++;
+        else if (s === 'CALIBRATED') calibratedCount++;
+      });
+
+      chartRegistry['analyticsDoughnut'] = new Chart(ctx, {
+        type: 'doughnut',
+        data: {
+          labels: ['CLEAR', 'WATCH', 'PRE_CLOG', 'CALIBRATED'],
+          datasets: [{
+            data: [clearCount, watchCount, preclogCount, calibratedCount],
+            backgroundColor: ['#22c55e', '#f59e0b', '#ef4444', '#3b82f6'],
+            borderWidth: 2
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 11 } } }
+          }
+        }
+      });
+      return;
+    }
+
+    // Fallback: Sensor FSM state counts from summary or rawReadings
+    const sc = (summary && summary.state_counts) ? { ...summary.state_counts } : {};
+    if (Object.keys(sc).length === 0 && rawReadings && rawReadings.length > 0) {
+      rawReadings.forEach(r => {
+        const key = String(r.state || 'IDLE').toUpperCase();
+        sc[key] = (sc[key] || 0) + 1;
+      });
+    }
+    const stateLabels = Object.keys(sc).length > 0 ? Object.keys(sc) : ['IDLE'];
+    const stateValues = Object.keys(sc).length > 0 ? stateLabels.map(k => sc[k]) : [0];
+    const palette = {
+      IDLE: '#22c55e',
+      RAIN: '#38bdf8',
+      PEAK: '#f59e0b',
+      ROD: '#ffd60a',
+      ALERT: '#ef4444'
+    };
+
     chartRegistry['analyticsDoughnut'] = new Chart(ctx, {
       type: 'doughnut',
       data: {
-        labels: ['CLEAR', 'WATCH', 'PRE_CLOG', 'CALIBRATED'],
+        labels: stateLabels,
         datasets: [{
-          data: [clearCount, watchCount, preclogCount, calibratedCount],
-          backgroundColor: ['#22c55e', '#f59e0b', '#ef4444', '#3b82f6'],
+          data: stateValues,
+          backgroundColor: stateLabels.map(k => palette[k] || '#94a3b8'),
           borderWidth: 2
         }]
       },
@@ -1940,73 +2143,112 @@
   }
 
   /**
-   * Chart (d): Scatter plot Initial Water Depth H1 vs Measured RoD
+   * Chart (d): Scatter plot (H1 vs RoD) OR (Water Depth vs Ultrasonic Distance)
    */
-  function initAnalyticsScatterChart(events) {
+  function initAnalyticsScatterChart(events, rawReadings) {
     const canvas = document.getElementById('chart-analytics-scatter');
     if (!canvas) return;
     destroyChart('analyticsScatter');
 
-    const points = events
-      .filter(e => e.h1_cm !== null && e.rod_cm_min !== null)
-      .map(e => ({
-        x: Number(e.h1_cm) || 0,
-        y: Number(e.rod_cm_min) || 0
+    const ctx = canvas.getContext('2d');
+
+    if (events && events.length > 0) {
+      const points = events
+        .filter(e => e.h1_cm !== null && e.rod_cm_min !== null)
+        .map(e => ({
+          x: Number(e.h1_cm) || 0,
+          y: Number(e.rod_cm_min) || 0
+        }));
+
+      chartRegistry['analyticsScatter'] = new Chart(ctx, {
+        type: 'scatter',
+        data: {
+          datasets: [{
+            label: 'Events (H1 vs RoD)',
+            data: points,
+            backgroundColor: '#ffd60a',
+            borderColor: '#050507',
+            borderWidth: 1,
+            pointRadius: 6,
+            pointHoverRadius: 8
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: {
+            x: { title: { display: true, text: 'Initial Depth H1 (cm)' } },
+            y: { title: { display: true, text: 'Rate of Drop (cm/min)' } }
+          }
+        }
+      });
+      return;
+    }
+
+    const readingPoints = (rawReadings || [])
+      .slice(-150)
+      .filter(r => r.water_cm !== null && r.water_cm !== undefined)
+      .map(r => ({
+        x: Number(r.distance_cm) || 0,
+        y: Number(r.water_cm) || 0
       }));
 
-    const ctx = canvas.getContext('2d');
     chartRegistry['analyticsScatter'] = new Chart(ctx, {
       type: 'scatter',
       data: {
         datasets: [{
-          label: 'Events (H1 vs RoD)',
-          data: points,
+          label: 'Readings (Sensor Dist vs Water Depth)',
+          data: readingPoints,
           backgroundColor: '#ffd60a',
           borderColor: '#050507',
           borderWidth: 1,
-          pointRadius: 6,
-          pointHoverRadius: 8
+          pointRadius: 4,
+          pointHoverRadius: 7
         }]
       },
       options: {
         responsive: true,
         maintainAspectRatio: false,
         scales: {
-          x: { title: { display: true, text: 'Initial Depth H1 (cm)' } },
-          y: { title: { display: true, text: 'Rate of Drop (cm/min)' } }
+          x: { title: { display: true, text: 'Ultrasonic Air Gap (cm)' } },
+          y: { beginAtZero: true, title: { display: true, text: 'Water Depth (cm)' } }
         }
       }
     });
   }
 
   /**
-   * Chart (e): Rain events per ISO week bar chart
+   * Chart (e): Rain events per week OR Daily telemetry readings volume
    */
-  function initAnalyticsWeeklyChart(events) {
+  function initAnalyticsWeeklyChart(events, rawReadings) {
     const canvas = document.getElementById('chart-analytics-weekly');
     if (!canvas) return;
     destroyChart('analyticsWeekly');
 
-    // Group events by ISO week or last 6 weeks
-    const weekMap = {};
-    events.forEach(e => {
-      const d = new Date(e.created_at);
+    const ctx = canvas.getContext('2d');
+    const sourceItems = (events && events.length > 0) ? events : (rawReadings || []);
+    const isEventMode = events && events.length > 0;
+
+    const bucketMap = {};
+    sourceItems.forEach(item => {
+      const d = new Date(item.created_at);
       if (!isNaN(d.getTime())) {
-        const key = `Wk ${Math.ceil(d.getDate() / 7)} (${d.toLocaleString('en-US', { month: 'short' })})`;
-        weekMap[key] = (weekMap[key] || 0) + 1;
+        const key = isEventMode
+          ? `Wk ${Math.ceil(d.getDate() / 7)} (${d.toLocaleString('en-US', { month: 'short' })})`
+          : d.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short' });
+        bucketMap[key] = (bucketMap[key] || 0) + 1;
       }
     });
 
-    const labels = Object.keys(weekMap).slice(-6);
-    const counts = labels.map(l => weekMap[l]);
+    const labels = Object.keys(bucketMap).slice(-7);
+    const counts = labels.map(l => bucketMap[l]);
 
-    const ctx = canvas.getContext('2d');
     chartRegistry['analyticsWeekly'] = new Chart(ctx, {
       type: 'bar',
       data: {
-        labels: labels.length > 0 ? labels : ['Current Week'],
+        labels: labels.length > 0 ? labels : ['Current Day'],
         datasets: [{
-          label: 'Rainfall Cycles Count',
+          label: isEventMode ? 'Rainfall Cycles Count' : 'Telemetry Readings Count',
           data: counts.length > 0 ? counts : [0],
           backgroundColor: '#ffd60a',
           borderRadius: 6
@@ -2016,7 +2258,7 @@
         responsive: true,
         maintainAspectRatio: false,
         scales: {
-          y: { beginAtZero: true, ticks: { stepSize: 1 }, title: { display: true, text: 'Events Count' } }
+          y: { beginAtZero: true, title: { display: true, text: isEventMode ? 'Events Count' : 'Readings Count' } }
         }
       }
     });
@@ -2031,45 +2273,77 @@
     showSkeleton('tab-trends', 'Analyzing long-term rate of drop degradation trends...');
 
     try {
-      const [trendData, configData] = await Promise.all([
-        API.getAnalyticsTrend(state.currentDeviceId, getDaysFromRange(state.trendsRange)),
-        API.getDeviceOverview(state.currentDeviceId)
+      const rangeCfg = getTrendRangeConfig(state.trendsRange);
+      const fromDate = new Date(Date.now() - rangeCfg.ms).toISOString();
+
+      const [trendData, configData, readingsRes] = await Promise.all([
+        API.getAnalyticsTrend(state.currentDeviceId, rangeCfg.days),
+        API.getDeviceOverview(state.currentDeviceId),
+        API.getReadings({
+          device_id: state.currentDeviceId,
+          from: fromDate,
+          bucket: rangeCfg.bucket,
+          pageSize: 300,
+          limit: 300
+        }).catch(() => ({ data: [] }))
       ]);
 
       const trend = trendData || {};
       const config = (configData && configData.config) || {};
       const points = trend.events || trend.points || [];
-      const insightText = typeof trend.insight === 'string'
-        ? trend.insight
-        : (trend.insight && trend.insight.text ? trend.insight.text : 'Drainage velocity is stable and within calibration baseline.');
-      const isDeclining = (trend.slope_per_week !== null && trend.slope_per_week !== undefined && trend.slope_per_week < 0) || (trend.insight && trend.insight.status === 'declining');
-      const projectedDays = trend.projected_days_until_preclog || (trend.insight && trend.insight.projected_days);
 
-      // Water series: if trend doesn't include water_series, fetch historical readings
-      let waterSeries = trend.water_series || [];
-      if (!waterSeries || waterSeries.length === 0) {
-        try {
-          const days = getDaysFromRange(state.trendsRange);
-          const fromDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-          const readingsRes = await API.getReadings({
-            device_id: state.currentDeviceId,
-            from: fromDate,
-            pageSize: 100,
-            limit: 100
-          });
-          const raw = Array.isArray(readingsRes) ? readingsRes : (readingsRes.data || readingsRes.readings || []);
-          waterSeries = raw.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-        } catch (e) {
-          // ignore
+      const fetchedSeries = Array.isArray(readingsRes) ? readingsRes : (readingsRes.data || readingsRes.readings || []);
+      const normalizedFetched = fetchedSeries
+        .map(p => ({
+          ...p,
+          time: p.time || p.created_at,
+          water_cm: Number(p.water_cm_avg !== undefined ? p.water_cm_avg : p.water_cm) || 0,
+          water_cm_max: p.water_cm_max !== undefined ? Number(p.water_cm_max) : undefined
+        }))
+        .sort((a, b) => new Date(a.time) - new Date(b.time));
+
+      const backendSeries = Array.isArray(trend.water_series)
+        ? trend.water_series
+          .filter(p => new Date(p.time || p.created_at).getTime() >= new Date(fromDate).getTime())
+          .map(p => ({
+            ...p,
+            time: p.time || p.created_at,
+            water_cm: Number(p.water_cm_avg !== undefined ? p.water_cm_avg : p.water_cm) || 0
+          }))
+          .sort((a, b) => new Date(a.time) - new Date(b.time))
+        : [];
+
+      const waterSeries = normalizedFetched.length >= 2 ? normalizedFetched : (backendSeries.length > 0 ? backendSeries : normalizedFetched);
+
+      const readingCount = trend.reading_count !== undefined ? trend.reading_count : waterSeries.length;
+      const avgWater = waterSeries.length > 0
+        ? waterSeries.reduce((s, p) => s + (Number(p.water_cm) || 0), 0) / waterSeries.length
+        : (trend.avg_water_cm || 0);
+      const peakWater = waterSeries.length > 0
+        ? Math.max(...waterSeries.map(p => Number(p.water_cm_max !== undefined ? p.water_cm_max : p.water_cm) || 0))
+        : (trend.peak_water_cm || 0);
+
+      let insightText = typeof trend.insight === 'string'
+        ? trend.insight
+        : (trend.insight && trend.insight.text ? trend.insight.text : '');
+      if (!insightText || insightText === 'Not enough data') {
+        if (waterSeries.length > 0) {
+          insightText = `Analyzed ${waterSeries.length} telemetry points in the ${state.trendsRange} window: average water depth ${avgWater.toFixed(1)} cm (peak ${peakWater.toFixed(1)} cm). Predictive RoD degradation regression will activate as drain drop cycles accumulate.`;
+        } else {
+          insightText = 'Awaiting telemetry packets in this time window. Try widening the range to 7d or 30d.';
         }
       }
+
+      const isDeclining = (trend.slope_per_week !== null && trend.slope_per_week !== undefined && trend.slope_per_week < 0) || (trend.insight && trend.insight.status === 'declining');
+      const projectedDays = trend.projected_days_until_preclog || (trend.insight && trend.insight.projected_days);
+      const hasRatioPoints = points && points.length > 0;
 
       container.innerHTML = `
         <!-- Time Range Selector -->
         <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.25rem;">
           <div>
-            <h2 style="font-size: 1.3rem; font-weight: 800;">Degradation & Velocity Trends</h2>
-            <p style="font-size: 0.85rem; color: var(--text-secondary);">Predictive linear regression and clogging projection models</p>
+            <h2 style="font-size: 1.3rem; font-weight: 800;">Degradation &amp; Velocity Trends</h2>
+            <p style="font-size: 0.85rem; color: var(--text-secondary);">Predictive linear regression, hydrology envelope &amp; clogging projection models</p>
           </div>
 
           <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
@@ -2083,13 +2357,20 @@
 
         <!-- Predictive AI / Regression Insight Card -->
         <div class="card" style="margin-bottom: 1.25rem; border-left: 5px solid ${isDeclining ? 'var(--color-watch)' : 'var(--color-clear)'};">
-          <div style="display: flex; align-items: center; gap: 0.75rem;">
+          <div style="display: flex; align-items: flex-start; gap: 0.85rem; flex-wrap: wrap;">
             <span style="font-size: 1.8rem;">${isDeclining ? '⚠️' : '💡'}</span>
-            <div style="flex: 1;">
-              <h4 style="font-size: 1rem; margin-bottom: 0.2rem;">Predictive Maintenance Diagnostic</h4>
-              <p style="font-size: 0.85rem; color: var(--text-secondary);">${escapeHTML(insightText)}</p>
+            <div style="flex: 1; min-width: 240px;">
+              <h4 style="font-size: 1rem; margin-bottom: 0.25rem;">Predictive Maintenance Diagnostic</h4>
+              <p style="font-size: 0.85rem; color: var(--text-secondary); line-height: 1.45;">${escapeHTML(insightText)}</p>
+              <div style="display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.65rem;">
+                <span class="badge badge-info">📡 ${waterSeries.length} Window Points (${readingCount} total)</span>
+                <span class="badge clear">Mean: ${avgWater.toFixed(1)} cm</span>
+                <span class="badge ${peakWater >= (Number(config.rain_start_cm) || 10) ? 'watch' : 'clear'}">Peak: ${peakWater.toFixed(1)} cm</span>
+                ${trend.slope_per_week !== null && trend.slope_per_week !== undefined ? `<span class="badge ${trend.slope_per_week < 0 ? 'watch' : 'clear'}">Slope: ${trend.slope_per_week > 0 ? '+' : ''}${Number(trend.slope_per_week).toFixed(3)}/wk</span>` : ''}
+                ${trend.r_squared !== null && trend.r_squared !== undefined ? `<span class="badge calibrated">R²: ${Number(trend.r_squared).toFixed(2)}</span>` : ''}
+              </div>
               ${projectedDays ? `
-                <div style="margin-top: 0.4rem; font-size: 0.8rem; font-weight: 700; color: var(--color-watch);">
+                <div style="margin-top: 0.5rem; font-size: 0.8rem; font-weight: 700; color: var(--color-watch);">
                   ⏳ Projected time to blockage threshold: ~${projectedDays} days under forecasted precipitation
                 </div>
               ` : ''}
@@ -2100,19 +2381,19 @@
         <!-- Water Level Downsampled Trend Chart -->
         <div class="card" style="margin-bottom: 1.25rem;">
           <div class="card-header">
-            <h3 class="card-title"><span>🌊</span> Water Level Profile with Rain Threshold</h3>
-            <span class="card-subtitle">Downsampled Time-Series</span>
+            <h3 class="card-title"><span>🌊</span> Water Level Profile with Rain Threshold (${escapeHTML(state.trendsRange)})</h3>
+            <span class="card-subtitle">${rangeCfg.bucket === 'raw' ? 'Full-Resolution Telemetry' : `Bucketed (${rangeCfg.bucket}) Time-Series`}</span>
           </div>
           <div class="chart-container">
             <canvas id="chart-trends-water"></canvas>
           </div>
         </div>
 
-        <!-- RoD Ratio Trend & Regression Line Chart -->
+        <!-- RoD Ratio Trend OR Telemetry Moving Baseline Stability Chart -->
         <div class="card">
           <div class="card-header">
-            <h3 class="card-title"><span>📉</span> Rate of Drop Ratio Trend & Slope</h3>
-            <span class="card-subtitle">Hollow points designate low-confidence readings</span>
+            <h3 class="card-title"><span>📉</span> ${hasRatioPoints ? 'Rate of Drop Ratio Trend & Slope' : 'Water Depth Moving Baseline & Stability'}</h3>
+            <span class="card-subtitle">${hasRatioPoints ? 'Hollow points designate low-confidence readings' : 'Instantaneous depth vs rolling 5-point baseline & flood threshold'}</span>
           </div>
           <div class="chart-container">
             <canvas id="chart-trends-ratio"></canvas>
@@ -2130,7 +2411,7 @@
 
       // Initialize trend charts
       initTrendsWaterChart(waterSeries, config);
-      initTrendsRatioChart(points, trend);
+      initTrendsRatioChart(points, trend, waterSeries, config);
 
     } catch (err) {
       console.error('[Trends] Render failed:', err);
@@ -2138,10 +2419,16 @@
     }
   }
 
+  function getTrendRangeConfig(range) {
+    if (range === '1h') return { days: 1, ms: 60 * 60 * 1000, bucket: 'raw' };
+    if (range === '6h') return { days: 1, ms: 6 * 60 * 60 * 1000, bucket: '5m' };
+    if (range === '24h') return { days: 1, ms: 24 * 60 * 60 * 1000, bucket: '15m' };
+    if (range === '7d') return { days: 7, ms: 7 * 24 * 60 * 60 * 1000, bucket: '1h' };
+    return { days: 30, ms: 30 * 24 * 60 * 60 * 1000, bucket: '1d' };
+  }
+
   function getDaysFromRange(range) {
-    if (range === '1h' || range === '6h' || range === '24h') return 1;
-    if (range === '7d') return 7;
-    return 30;
+    return getTrendRangeConfig(range).days;
   }
 
   /**
@@ -2153,29 +2440,193 @@
     destroyChart('trendsWater');
 
     const labels = series.map(p => formatShortIST(p.time || p.created_at));
-    const values = series.map(p => Number(p.water_cm) || 0);
+    const values = series.map(p => Number(p.water_cm_avg !== undefined ? p.water_cm_avg : p.water_cm) || 0);
+    const hasMaxSeries = series.some(p => p.water_cm_max !== undefined);
     const rainThreshold = Number(config.rain_start_cm) || 10;
+
+    const datasets = [
+      {
+        label: 'Water Depth (cm)',
+        data: values.length > 0 ? values : [0],
+        borderColor: '#38bdf8',
+        backgroundColor: 'rgba(56, 189, 248, 0.14)',
+        fill: true,
+        tension: 0.3,
+        borderWidth: 2.2,
+        pointRadius: values.length > 60 ? 0 : 2.5
+      }
+    ];
+
+    if (hasMaxSeries && series.length > 0) {
+      datasets.push({
+        label: 'Bucket Peak (cm)',
+        data: series.map(p => Number(p.water_cm_max !== undefined ? p.water_cm_max : p.water_cm) || 0),
+        borderColor: 'rgba(255, 214, 10, 0.65)',
+        borderDash: [3, 3],
+        borderWidth: 1.5,
+        pointRadius: 0,
+        tension: 0.25,
+        fill: false
+      });
+    }
+
+    datasets.push({
+      label: 'Rain Start Threshold',
+      data: (labels.length > 0 ? labels : ['No Data']).map(() => rainThreshold),
+      borderColor: '#ffd60a',
+      borderDash: [5, 5],
+      borderWidth: 1.5,
+      pointRadius: 0,
+      fill: false
+    });
 
     const ctx = canvas.getContext('2d');
     chartRegistry['trendsWater'] = new Chart(ctx, {
       type: 'line',
       data: {
         labels: labels.length > 0 ? labels : ['No Data'],
+        datasets
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          y: { beginAtZero: true, title: { display: true, text: 'Water Depth (cm)' } },
+          x: { title: { display: true, text: 'Observation Window (IST)' } }
+        }
+      }
+    });
+  }
+
+  /**
+   * RoD Ratio Trend with Regression Line (falls back to Rolling Baseline Depth Stability when no RoD events exist)
+   */
+  function initTrendsRatioChart(points, regression, waterSeries, config) {
+    const canvas = document.getElementById('chart-trends-ratio');
+    if (!canvas) return;
+    destroyChart('trendsRatio');
+
+    const ctx = canvas.getContext('2d');
+
+    if (points && points.length > 0) {
+      const labels = points.map(p => formatShortIST(p.created_at));
+      const ratios = points.map(p => Number(p.ratio) || 0);
+
+      // Color points according to status; low confidence points hollow
+      const pointBorderColors = points.map(p => {
+        const s = String(p.status).toUpperCase();
+        if (s === 'CLEAR') return '#22c55e';
+        if (s === 'WATCH') return '#f59e0b';
+        return '#ef4444';
+      });
+
+      const pointBackgroundColors = points.map((p, idx) => {
+        return p.low_confidence ? 'transparent' : pointBorderColors[idx];
+      });
+
+      let regressionData = [];
+      if (points.length >= 2) {
+        const n = points.length;
+        let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+        for (let i = 0; i < n; i++) {
+          const x = i;
+          const y = Number(points[i].ratio) || 0;
+          sumX += x; sumY += y; sumXY += x * y; sumX2 += x * x;
+        }
+        const denom = n * sumX2 - sumX * sumX;
+        const slope = denom !== 0 ? (n * sumXY - sumX * sumY) / denom : 0;
+        const intercept = (sumY - slope * sumX) / n;
+        regressionData = points.map((_, idx) => Math.max(0, slope * idx + intercept));
+      } else {
+        regressionData = ratios.slice();
+      }
+
+      chartRegistry['trendsRatio'] = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels,
+          datasets: [
+            {
+              label: 'ROD Ratio (Actual)',
+              data: ratios,
+              borderColor: '#94a3b8',
+              pointBorderColor: pointBorderColors,
+              pointBackgroundColor: pointBackgroundColors,
+              pointBorderWidth: 2,
+              pointRadius: 6,
+              showLine: true,
+              borderWidth: 1.5
+            },
+            {
+              label: 'Regression Trend Slope',
+              data: regressionData,
+              borderColor: '#ef4444',
+              borderWidth: 2,
+              borderDash: [6, 4],
+              pointRadius: 0,
+              fill: false
+            },
+            {
+              label: 'Watch Line (0.8)',
+              data: labels.map(() => 0.8),
+              borderColor: '#f59e0b',
+              borderDash: [2, 2],
+              borderWidth: 1,
+              pointRadius: 0,
+              fill: false
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: {
+            y: { min: 0, max: 1.5, title: { display: true, text: 'ROD Ratio vs Baseline' } }
+          }
+        }
+      });
+      return;
+    }
+
+    // Fallback when 0 RoD cycles exist yet: plot rolling 5-point moving baseline vs flood limit
+    const series = waterSeries || [];
+    const labels = series.map(p => formatShortIST(p.time || p.created_at));
+    const rawValues = series.map(p => Number(p.water_cm_avg !== undefined ? p.water_cm_avg : p.water_cm) || 0);
+    const movingAvg = rawValues.map((_, idx) => {
+      const start = Math.max(0, idx - 4);
+      const slice = rawValues.slice(start, idx + 1);
+      return Number((slice.reduce((s, v) => s + v, 0) / slice.length).toFixed(2));
+    });
+    const floodAlertCm = Number((config && config.flood_alert_cm) || 80);
+
+    chartRegistry['trendsRatio'] = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: labels.length > 0 ? labels : ['No Telemetry'],
         datasets: [
           {
-            label: 'Water Depth (cm)',
-            data: values.length > 0 ? values : [0],
-            borderColor: '#38bdf8',
-            backgroundColor: 'rgba(56, 189, 248, 0.14)',
+            label: '5-Point Moving Average Depth (cm)',
+            data: movingAvg.length > 0 ? movingAvg : [0],
+            borderColor: '#ffd60a',
+            backgroundColor: 'rgba(255, 214, 10, 0.10)',
+            borderWidth: 2.2,
+            tension: 0.35,
             fill: true,
-            tension: 0.3,
-            borderWidth: 2.2
+            pointRadius: 0
           },
           {
-            label: 'Rain Start Threshold',
-            data: labels.map(() => rainThreshold),
-            borderColor: '#ffd60a',
-            borderDash: [5, 5],
+            label: 'Observed Depth (cm)',
+            data: rawValues.length > 0 ? rawValues : [0],
+            borderColor: '#94a3b8',
+            borderWidth: 1,
+            pointRadius: rawValues.length > 60 ? 0 : 2,
+            fill: false
+          },
+          {
+            label: `Flood Alert Threshold (${floodAlertCm} cm)`,
+            data: (labels.length > 0 ? labels : ['No Telemetry']).map(() => floodAlertCm),
+            borderColor: '#ef4444',
+            borderDash: [5, 4],
             borderWidth: 1.5,
             pointRadius: 0,
             fill: false
@@ -2186,95 +2637,8 @@
         responsive: true,
         maintainAspectRatio: false,
         scales: {
-          y: { beginAtZero: true, title: { display: true, text: 'Water Depth (cm)' } },
-          x: { title: { display: true, text: 'Observation Window' } }
-        }
-      }
-    });
-  }
-
-  /**
-   * RoD Ratio Trend with Regression Line
-   */
-  function initTrendsRatioChart(points, regression) {
-    const canvas = document.getElementById('chart-trends-ratio');
-    if (!canvas) return;
-    destroyChart('trendsRatio');
-
-    const labels = points.map(p => formatShortIST(p.created_at));
-    const ratios = points.map(p => Number(p.ratio) || 0);
-
-    // Color points according to status; low confidence points hollow
-    const pointBorderColors = points.map(p => {
-      const s = String(p.status).toUpperCase();
-      if (s === 'CLEAR') return '#22c55e';
-      if (s === 'WATCH') return '#f59e0b';
-      return '#ef4444';
-    });
-
-    const pointBackgroundColors = points.map((p, idx) => {
-      return p.low_confidence ? 'transparent' : pointBorderColors[idx];
-    });
-
-    let regressionData = [];
-    if (points.length >= 2) {
-      const n = points.length;
-      let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
-      for (let i = 0; i < n; i++) {
-        const x = i;
-        const y = Number(points[i].ratio) || 0;
-        sumX += x; sumY += y; sumXY += x * y; sumX2 += x * x;
-      }
-      const denom = n * sumX2 - sumX * sumX;
-      const slope = denom !== 0 ? (n * sumXY - sumX * sumY) / denom : 0;
-      const intercept = (sumY - slope * sumX) / n;
-      regressionData = points.map((_, idx) => Math.max(0, slope * idx + intercept));
-    } else {
-      regressionData = labels.map(() => 1.0);
-    }
-
-    const ctx = canvas.getContext('2d');
-    chartRegistry['trendsRatio'] = new Chart(ctx, {
-      type: 'line',
-      data: {
-        labels: labels.length > 0 ? labels : ['No Data'],
-        datasets: [
-          {
-            label: 'ROD Ratio (Actual)',
-            data: ratios.length > 0 ? ratios : [1.0],
-            borderColor: '#94a3b8',
-            pointBorderColor: pointBorderColors,
-            pointBackgroundColor: pointBackgroundColors,
-            pointBorderWidth: 2,
-            pointRadius: 6,
-            showLine: true,
-            borderWidth: 1
-          },
-          {
-            label: 'Regression Trend Slope',
-            data: regressionData,
-            borderColor: '#ef4444',
-            borderWidth: 2,
-            borderDash: [6, 4],
-            pointRadius: 0,
-            fill: false
-          },
-          {
-            label: 'Watch Line (0.8)',
-            data: labels.map(() => 0.8),
-            borderColor: '#f59e0b',
-            borderDash: [2, 2],
-            borderWidth: 1,
-            pointRadius: 0,
-            fill: false
-          }
-        ]
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        scales: {
-          y: { min: 0, max: 1.5, title: { display: true, text: 'ROD Ratio vs Baseline' } }
+          y: { beginAtZero: true, title: { display: true, text: 'Water Depth Baseline (cm)' } },
+          x: { title: { display: true, text: 'Observation Window (IST)' } }
         }
       }
     });
@@ -2289,17 +2653,17 @@
     container.innerHTML = `
       <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.25rem;">
         <div>
-          <h2 style="font-size: 1.3rem; font-weight: 800;">Telemetry & Event Audit Logs</h2>
-          <p style="font-size: 0.85rem; color: var(--text-secondary);">Auditable logs for GCC stormwater quality audits</p>
+          <h2 style="font-size: 1.3rem; font-weight: 800;">Telemetry &amp; Event Audit Logs</h2>
+          <p style="font-size: 0.85rem; color: var(--text-secondary);">Auditable logs for GCC stormwater quality &amp; hydraulic audits</p>
         </div>
 
         <!-- Sub-tab Toggles & CSV Export -->
         <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
           <button id="subtab-events-btn" class="btn ${state.historySubtab === 'events' ? 'btn-primary' : 'btn-secondary'} btn-sm">
-            <span>📜</span> Drain Events
+            <span>📜</span> Drain Events <span id="history-events-count-pill"></span>
           </button>
           <button id="subtab-readings-btn" class="btn ${state.historySubtab === 'readings' ? 'btn-primary' : 'btn-secondary'} btn-sm">
-            <span>📡</span> Raw Readings
+            <span>📡</span> Raw Readings <span id="history-readings-count-pill"></span>
           </button>
           <button id="btn-export-csv" class="btn btn-secondary btn-sm" title="Export CSV file">
             <span>📥</span> Export CSV
@@ -2323,7 +2687,9 @@
             </div>
           ` : ''}
           <span style="font-size: 0.8rem; color: var(--text-muted);">
-            Click on any event row to open high-resolution diagnostic drawer.
+            ${state.historySubtab === 'events'
+              ? 'Click any event row to open the +/- 15 min water level profile drawer.'
+              : 'Live ultrasonic sensor telemetry captured every 5 seconds.'}
           </span>
         </div>
       </div>
@@ -2368,8 +2734,19 @@
     }
   }
 
+  function updateHistoryCountPills(eventsCount, readingsCount) {
+    const evPill = document.getElementById('history-events-count-pill');
+    const rdPill = document.getElementById('history-readings-count-pill');
+    if (evPill && eventsCount !== undefined && eventsCount !== null) {
+      evPill.textContent = `(${eventsCount})`;
+    }
+    if (rdPill && readingsCount !== undefined && readingsCount !== null) {
+      rdPill.textContent = `(${readingsCount})`;
+    }
+  }
+
   /**
-   * Fetches and renders Drain Events table
+   * Fetches and renders Drain Events table (falls back to telemetry-derived drop cycles or prompts raw readings)
    */
   async function fetchHistoryEvents() {
     const container = document.getElementById('history-table-container');
@@ -2386,23 +2763,87 @@
         status: state.historyStatusFilter || undefined
       };
 
-      const res = await API.getRodEvents(params);
-      const events = Array.isArray(res) ? res : (res.data || res.events || []);
-      const total = res.total !== undefined ? res.total : events.length;
+      const [res, summaryRes, rawCountRes] = await Promise.all([
+        API.getRodEvents(params),
+        API.getAnalyticsSummary(state.currentDeviceId, 30).catch(() => ({})),
+        API.getReadings({ device_id: state.currentDeviceId, page: 1, pageSize: 1, limit: 1 }).catch(() => ({ total: 0 }))
+      ]);
+
+      const hwEvents = Array.isArray(res) ? res : (res.data || res.events || []);
+      const hwTotal = res.total !== undefined ? res.total : hwEvents.length;
+      const readingsTotal = (rawCountRes && rawCountRes.total !== undefined)
+        ? rawCountRes.total
+        : (summaryRes && summaryRes.total_readings !== undefined ? summaryRes.total_readings : null);
+
+      let events = hwEvents;
+      let total = hwTotal;
+      let isDerivedFallback = false;
+
+      if (events.length === 0 && state.historyEventsPage === 1 && summaryRes && Array.isArray(summaryRes.derived_events)) {
+        const filteredDerived = summaryRes.derived_events
+          .filter(ev => !state.historyStatusFilter || String(ev.status).toUpperCase() === state.historyStatusFilter)
+          .map((ev, idx) => ({
+            ...ev,
+            id: ev.id !== undefined ? ev.id : `derived-${idx + 1}`,
+            derived: true
+          }));
+
+        if (filteredDerived.length > 0) {
+          events = filteredDerived;
+          total = filteredDerived.length;
+          isDerivedFallback = true;
+        }
+      }
+
       state.historyEventsTotal = total;
+      updateHistoryCountPills(total, readingsTotal);
 
       if (events.length === 0) {
+        const avgStr = summaryRes && summaryRes.avg_water_cm !== null && summaryRes.avg_water_cm !== undefined
+          ? `${Number(summaryRes.avg_water_cm).toFixed(1)} cm`
+          : '--';
+        const peakStr = summaryRes && summaryRes.peak_water_cm !== null && summaryRes.peak_water_cm !== undefined
+          ? `${Number(summaryRes.peak_water_cm).toFixed(1)} cm`
+          : '--';
+
         container.innerHTML = `
           <div class="card" style="text-align: center; padding: 2rem;">
-            <p style="color: var(--text-secondary);">No drain events matching the selected filter.</p>
+            <p style="font-size: 1rem; font-weight: 700; margin-bottom: 0.4rem;">No Drain Drop Cycles Recorded Yet</p>
+            <p style="color: var(--text-secondary); font-size: 0.85rem; max-width: 560px; margin: 0 auto 1rem auto;">
+              ${state.historyStatusFilter
+                ? `No events match status "${escapeHTML(state.historyStatusFilter)}".`
+                : 'Rate-of-Drop events are created automatically after water rises above the rain threshold and recedes.'}
+              ${readingsTotal ? ` However, <strong>${readingsTotal} live sensor readings</strong> are already logged (Mean depth: ${avgStr}, Peak: ${peakStr}).` : ''}
+            </p>
+            ${readingsTotal ? `
+              <button id="btn-switch-to-raw-readings" class="btn btn-primary btn-sm">
+                <span>📡</span> View Raw Readings (${readingsTotal} records)
+              </button>
+            ` : ''}
           </div>
         `;
+
+        const switchBtn = document.getElementById('btn-switch-to-raw-readings');
+        if (switchBtn) {
+          switchBtn.addEventListener('click', () => {
+            state.historySubtab = 'readings';
+            renderHistoryTab();
+          });
+        }
         return;
       }
 
       const totalPages = Math.ceil(total / state.historyEventsLimit) || 1;
 
       container.innerHTML = `
+        ${isDerivedFallback ? `
+          <div class="card" style="margin-bottom: 1rem; padding: 0.75rem 1rem; border-left: 4px solid var(--accent-primary);">
+            <span style="font-size: 0.82rem; color: var(--text-secondary);">
+              ℹ️ Showing <strong>${events.length} telemetry-derived drain cycle(s)</strong> computed from raw sensor drop sequences. Hardware <code>rod_result</code> events will appear alongside these automatically.
+            </span>
+          </div>
+        ` : ''}
+
         <div class="table-responsive">
           <table class="data-table">
             <thead>
@@ -2418,10 +2859,13 @@
             </thead>
             <tbody>
               ${events.map(ev => {
-                const ratioPct = ev.ratio !== undefined ? Math.round(Number(ev.ratio) * 100) + '%' : '--';
+                const ratioPct = ev.ratio !== undefined && ev.ratio !== null ? Math.round(Number(ev.ratio) * 100) + '%' : '--';
                 return `
                   <tr data-event-id="${escapeHTML(ev.id)}" class="clickable-event-row">
-                    <td><strong>${formatIST(ev.created_at)}</strong></td>
+                    <td>
+                      <strong>${formatIST(ev.created_at)}</strong>
+                      ${ev.derived ? '<span class="badge calibrated" style="margin-left: 0.4rem; font-size: 0.68rem;">Telemetry</span>' : ''}
+                    </td>
                     <td>${Number(ev.h1_cm || 0).toFixed(1)}</td>
                     <td>${Number(ev.h2_cm || 0).toFixed(1)}</td>
                     <td>${formatDuration(ev.duration_s)}</td>
@@ -2495,6 +2939,7 @@
       const readings = Array.isArray(res) ? res : (res.data || res.readings || []);
       const total = res.total !== undefined ? res.total : readings.length;
       state.historyReadingsTotal = total;
+      updateHistoryCountPills(state.historyEventsTotal || null, total);
 
       if (readings.length === 0) {
         container.innerHTML = `
@@ -2529,10 +2974,10 @@
                   <td>${formatIST(r.created_at)}</td>
                   <td><span class="badge ${r.type === 'reading' ? 'calibrated' : 'offline'}">${escapeHTML(r.type)}</span></td>
                   <td><strong>${escapeHTML(r.state || '--')}</strong></td>
-                  <td style="font-weight: 700;">${r.water_cm !== undefined ? Number(r.water_cm).toFixed(1) : '--'}</td>
-                  <td>${r.distance_cm !== undefined ? Number(r.distance_cm).toFixed(1) : '--'}</td>
+                  <td style="font-weight: 700;">${r.water_cm !== undefined && r.water_cm !== null ? Number(r.water_cm).toFixed(1) : '--'}</td>
+                  <td>${r.distance_cm !== undefined && r.distance_cm !== null ? Number(r.distance_cm).toFixed(1) : '--'}</td>
                   <td>${r.flood_risk ? '<span class="badge preclog">RISK</span>' : '<span class="badge clear">OK</span>'}</td>
-                  <td>${r.rssi !== undefined ? `${r.rssi} dBm` : '--'}</td>
+                  <td>${r.rssi !== undefined && r.rssi !== null ? `${r.rssi} dBm` : '--'}</td>
                 </tr>
               `).join('')}
             </tbody>
