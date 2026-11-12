@@ -535,26 +535,51 @@
     const cancelBtn = document.getElementById('admin-cancel-btn');
     const form = document.getElementById('admin-form');
     const passwordInput = document.getElementById('admin-password-input');
+    const toggleBtn = document.getElementById('admin-password-toggle');
+    const errorEl = document.getElementById('admin-auth-error');
+    const submitBtn = document.getElementById('admin-submit-btn');
+
+    const clearAuthError = () => {
+      if (errorEl) {
+        errorEl.style.display = 'none';
+        errorEl.textContent = '';
+      }
+      if (passwordInput) {
+        passwordInput.style.borderColor = '';
+      }
+    };
+
+    if (toggleBtn && passwordInput) {
+      toggleBtn.addEventListener('click', () => {
+        const isMasked = passwordInput.type === 'password';
+        passwordInput.type = isMasked ? 'text' : 'password';
+        toggleBtn.textContent = isMasked ? '🙈' : '👁️';
+        toggleBtn.title = isMasked ? 'Hide password' : 'Show password';
+      });
+    }
+
+    if (passwordInput) {
+      passwordInput.addEventListener('input', clearAuthError);
+    }
 
     if (adminBtn) {
       adminBtn.addEventListener('click', () => {
         if (state.adminKey) {
-          // If already admin, clicking lock offers logout option
-          if (confirm('Lock admin mode and return to read-only?')) {
-            state.adminKey = null;
-            sessionStorage.removeItem('adminKey');
-            sessionStorage.removeItem('drainGuardAdminKey');
-            updateAdminUI();
-            showToast('Locked: Switched to read-only mode', 'info');
-            // Refresh current tab if settings or alerts
-            if (state.activeTab === 'settings' || state.activeTab === 'alerts') {
-              loadActiveTab();
-            }
+          state.adminKey = null;
+          sessionStorage.removeItem('adminKey');
+          sessionStorage.removeItem('drainGuardAdminKey');
+          updateAdminUI();
+          showToast('Admin locked — switched to read-only mode', 'info');
+          if (state.activeTab === 'settings' || state.activeTab === 'alerts') {
+            loadActiveTab();
           }
         } else {
           // Open unlock modal
+          clearAuthError();
           if (modal) modal.hidden = false;
           if (passwordInput) {
+            passwordInput.type = 'password';
+            if (toggleBtn) toggleBtn.textContent = '👁️';
             passwordInput.value = '';
             passwordInput.focus();
           }
@@ -565,6 +590,7 @@
     if (cancelBtn && modal) {
       cancelBtn.addEventListener('click', () => {
         modal.hidden = true;
+        clearAuthError();
       });
     }
 
@@ -572,6 +598,7 @@
       modal.addEventListener('click', (e) => {
         if (e.target === modal) {
           modal.hidden = true;
+          clearAuthError();
         }
       });
     }
@@ -582,8 +609,13 @@
         const pwd = passwordInput.value.trim();
         if (!pwd) return;
 
+        clearAuthError();
+        if (submitBtn) {
+          submitBtn.disabled = true;
+          submitBtn.textContent = 'Verifying...';
+        }
+
         try {
-          // Attempt verification against backend
           await API.verifyAdmin(pwd);
           state.adminKey = pwd;
           sessionStorage.setItem('adminKey', pwd);
@@ -591,11 +623,23 @@
           if (modal) modal.hidden = true;
           updateAdminUI();
           showToast('Admin mode unlocked successfully', 'success');
-          // Reload tab to reflect admin controls
           loadActiveTab();
         } catch (err) {
-          // If verify endpoint doesn't exist yet or failed, check password fallback
-          alert('Admin authentication failed: ' + (err.message || 'Incorrect password'));
+          const msg = (err && err.message) ? err.message : 'Incorrect admin password';
+          if (errorEl) {
+            errorEl.textContent = `Authentication failed: ${msg}`;
+            errorEl.style.display = 'block';
+          }
+          if (passwordInput) {
+            passwordInput.style.borderColor = 'var(--color-preclog)';
+            passwordInput.focus();
+            passwordInput.select();
+          }
+        } finally {
+          if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.textContent = 'Unlock';
+          }
         }
       });
     }
@@ -992,17 +1036,31 @@
       text.textContent = `Active ${diffSec}s ago`;
     } else if (diffSec < 3600) {
       text.textContent = `Active ${Math.floor(diffSec / 60)}m ago`;
-    } else {
+    } else if (diffSec < 172800) {
       text.textContent = `Offline (${Math.floor(diffSec / 3600)}h ago)`;
+    } else {
+      text.textContent = `Offline (${Math.floor(diffSec / 86400)}d ago)`;
     }
   }
 
   /**
-   * Scans alerts and surfaces the sticky red banner if critical issue detected
+   * Scans alerts and surfaces the sticky red banner + tab counter if critical/open issues exist
    */
   function checkCriticalAlerts(alertsList) {
     const banner = document.getElementById('alert-banner');
     const text = document.getElementById('alert-banner-text');
+    const navBadge = document.getElementById('nav-alerts-badge');
+
+    const openAlerts = alertsList.filter(a => a.status === 'open');
+    if (navBadge) {
+      if (openAlerts.length > 0) {
+        navBadge.textContent = openAlerts.length > 99 ? '99+' : String(openAlerts.length);
+        navBadge.hidden = false;
+      } else {
+        navBadge.hidden = true;
+      }
+    }
+
     if (!banner || !text) return;
 
     const criticals = alertsList.filter(a => 
@@ -4444,6 +4502,32 @@
     initAdminAuth();
     initNavigation();
     loadInitialData();
+
+    // Manual Sync / Refresh Button in Header
+    const refreshBtn = document.getElementById('header-refresh-btn');
+    if (refreshBtn) {
+      refreshBtn.addEventListener('click', async () => {
+        if (!state.currentDeviceId) {
+          loadInitialData();
+          return;
+        }
+        const icon = document.getElementById('refresh-icon');
+        if (icon) icon.classList.add('spin-once');
+        // Bust cache for current tab so operator gets guaranteed fresh backend state
+        if (state.activeTab === 'analytics') delete tabCache.analytics[`${state.currentDeviceId}_${state.analyticsDays}`];
+        if (state.activeTab === 'trends') {
+          Object.keys(tabCache.trends).forEach(k => {
+            if (k.startsWith(`${state.currentDeviceId}_`)) delete tabCache.trends[k];
+          });
+        }
+        if (state.activeTab === 'history') delete tabCache.history[`${state.currentDeviceId}_${state.historyMode}_${state.historyStatusFilter}_${state.historyPage}`];
+        if (state.activeTab === 'alerts') delete tabCache.alerts[state.currentDeviceId];
+
+        await loadActiveTab();
+        showToast('Telemetry synced from server', 'info', 2200);
+        setTimeout(() => { if (icon) icon.classList.remove('spin-once'); }, 650);
+      });
+    }
 
     // Global Escape key dismissal for Admin Modal & History Detail Drawer
     document.addEventListener('keydown', (e) => {

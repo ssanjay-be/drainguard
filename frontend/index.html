@@ -4,6 +4,10 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0">
   <meta name="theme-color" content="#070709">
+  <meta name="description" content="DrainGuard Telemetry OS — Real-time ESP32 ultrasonic stormwater clog detection, Rate of Dissipation (RoD) diagnostics, flood risk forecasting, and hydraulic analytics.">
+  <meta property="og:title" content="DrainGuard — Predictive Stormwater Clog Diagnostic">
+  <meta property="og:description" content="Real-time ESP32 ultrasonic drain monitoring, RoD baseline drift analytics, and automated flood pre-clog alerts.">
+  <meta property="og:type" content="website">
   <title>DrainGuard — Predictive Stormwater Clog Diagnostic</title>
 
   <!-- Preconnect to Render API & CDNs for faster initial handshake -->
@@ -48,7 +52,11 @@
         <!-- Brand & Title -->
         <div class="brand-wrapper">
           <div class="brand-emblem" aria-hidden="true">
-            <span class="brand-logo">🌧️</span>
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#FFD60A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 2v4M4.93 4.93l2.83 2.83M19.07 4.93l-2.83 2.83"/>
+              <path d="M5 13c0-3.87 3.13-7 7-7s7 3.13 7 7c0 2.5-1.5 4.8-3.6 6.2L12 22l-3.4-2.8C6.5 17.8 5 15.5 5 13z"/>
+              <circle cx="12" cy="13" r="2.2" fill="#FFD60A" stroke="none"/>
+            </svg>
           </div>
           <div>
             <div class="brand-title-row">
@@ -74,6 +82,11 @@
             <span id="online-dot" class="online-dot offline"></span>
             <span id="last-seen-text">Checking...</span>
           </div>
+
+          <!-- Manual Sync / Refresh Button -->
+          <button id="header-refresh-btn" class="btn-icon" aria-label="Sync live telemetry now" title="Sync telemetry now">
+            <span id="refresh-icon">↻</span>
+          </button>
 
           <!-- Theme Toggle (Dark Obsidian / Light Gold) -->
           <button id="theme-toggle" class="btn-icon" aria-label="Toggle dark or light theme" title="Toggle Obsidian / Daylight theme">
@@ -121,6 +134,7 @@
         </button>
         <button class="tab-btn" data-tab="alerts" role="tab" aria-selected="false" id="tab-btn-alerts">
           <span class="tab-icon">🔔</span> Alerts
+          <span id="nav-alerts-badge" class="nav-alert-counter" hidden>0</span>
         </button>
         <button class="tab-btn" data-tab="settings" role="tab" aria-selected="false" id="tab-btn-settings">
           <span class="tab-icon">⚙️</span> Settings
@@ -134,7 +148,23 @@
 
     <!-- Tab 1: Overview -->
     <div class="tab-panel active" id="tab-overview" role="tabpanel" aria-labelledby="tab-btn-overview">
-      <div class="skeleton-loader">Syncing DrainGuard telemetry...</div>
+      <div class="skeleton-loader" role="status" aria-live="polite">
+        <div class="dg-sonar-orb" aria-hidden="true">
+          <span class="dg-sonar-ring ring-1"></span>
+          <span class="dg-sonar-ring ring-2"></span>
+          <span class="dg-sonar-ring ring-3"></span>
+          <span class="dg-sonar-core">⚡</span>
+        </div>
+        <div class="dg-loader-wave" aria-hidden="true">
+          <span></span><span></span><span></span><span></span><span></span>
+        </div>
+        <div class="dg-loader-caption">Syncing DrainGuard ultrasonic telemetry...</div>
+        <div class="dg-loader-subcards" aria-hidden="true">
+          <div class="dg-shimmer-tile"></div>
+          <div class="dg-shimmer-tile"></div>
+          <div class="dg-shimmer-tile"></div>
+        </div>
+      </div>
     </div>
 
     <!-- Tab 2: Analytics -->
@@ -166,7 +196,7 @@
 
   <!-- ─── 6. Footer ───────────────────────────────────────────── -->
   <footer class="app-footer">
-    <p>⚡ DrainGuard — Predictive Stormwater Clog Diagnostic System | Built for Greater Chennai Corporation</p>
+    <p>⚡ DrainGuard Telemetry OS · Predictive Stormwater Clog Diagnostics · Real-Time Ultrasonic IoT Platform</p>
   </footer>
 
   <!-- ─── 7. Toast Container ──────────────────────────────────── -->
@@ -182,7 +212,11 @@
       <form id="admin-form">
         <div class="form-group">
           <label for="admin-password-input" class="form-label">Admin Password</label>
-          <input type="password" id="admin-password-input" class="form-control" placeholder="••••••••••••" required autocomplete="current-password">
+          <div style="position: relative; display: flex; align-items: center;">
+            <input type="password" id="admin-password-input" class="form-control" placeholder="••••••••••••" required autocomplete="current-password" style="padding-right: 2.75rem;">
+            <button type="button" id="admin-password-toggle" class="btn-icon" style="position: absolute; right: 6px; padding: 0.2rem 0.45rem; font-size: 0.85rem; background: transparent; border: none;" aria-label="Toggle password visibility" title="Show/hide password">👁️</button>
+          </div>
+          <div id="admin-auth-error" style="color: var(--color-preclog); font-size: 0.78rem; font-weight: 600; margin-top: 0.45rem; display: none;"></div>
         </div>
         <div style="display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 1.25rem;">
           <button type="button" id="admin-cancel-btn" class="btn btn-secondary">Cancel</button>
