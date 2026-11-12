@@ -36,6 +36,7 @@
   /* Brand Accents — Matte Black & Precision Yellow */
   --brand-primary: #ca8a04;
   --brand-primary-hover: #a16207;
+  --accent-primary: #ca8a04;
   --brand-light: rgba(255, 214, 10, 0.16);
   --brand-dark: #09090b;
   --brand-yellow: #ffd60a;
@@ -84,6 +85,7 @@
 
   --brand-primary: #ffd60a;
   --brand-primary-hover: #f5c400;
+  --accent-primary: #ffd60a;
   --brand-light: rgba(255, 214, 10, 0.14);
   --brand-dark: #070709;
   --brand-yellow: #ffd60a;
@@ -163,6 +165,11 @@ button, input, select, textarea {
   color: inherit;
 }
 
+:focus-visible {
+  outline: 2px solid var(--brand-yellow);
+  outline-offset: 2px;
+}
+
 ::selection {
   background-color: var(--brand-yellow);
   color: #050507;
@@ -178,14 +185,19 @@ button, input, select, textarea {
   font-variant-numeric: tabular-nums;
 }
 
-/* ─── 3. Header & Navigation Bar (Frosted Apple Glass) ──────── */
+/* ─── 3. Unified Sticky Top Chrome & Header Bar ─────────────── */
+.top-chrome {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
 .app-header {
-  background-color: rgba(8, 8, 11, 0.86);
+  background-color: rgba(8, 8, 11, 0.9);
   backdrop-filter: saturate(180%) blur(20px);
   -webkit-backdrop-filter: saturate(180%) blur(20px);
   border-bottom: 1px solid rgba(255, 214, 10, 0.28);
-  position: sticky;
-  top: 0;
+  position: relative;
   z-index: 100;
   box-shadow: 0 4px 24px rgba(0, 0, 0, 0.35);
 }
@@ -373,16 +385,15 @@ button, input, select, textarea {
   border: 1px solid rgba(255, 255, 255, 0.18);
 }
 
-/* ─── 4. Sticky Critical Alert Banner ───────────────────────── */
+/* ─── 4. Critical Alert Banner ─────────────────────────────── */
 #alert-banner {
   background: linear-gradient(90deg, #b91c1c, #ef4444, #b91c1c);
   color: #ffffff;
-  padding: 0.65rem 1.25rem;
+  padding: 0.6rem 1.25rem;
   font-size: 0.85rem;
   font-weight: 600;
   box-shadow: 0 4px 16px rgba(239, 68, 68, 0.32);
-  position: sticky;
-  top: 63px;
+  position: relative;
   z-index: 95;
   display: flex;
   align-items: center;
@@ -604,6 +615,19 @@ button, input, select, textarea {
   background-color: rgba(142, 142, 147, 0.15);
   color: var(--text-secondary);
   border-color: rgba(142, 142, 147, 0.28);
+}
+
+.badge.badge-info {
+  background-color: var(--brand-light);
+  color: #926003;
+  border-color: var(--border-accent);
+  text-transform: none;
+  letter-spacing: 0.01em;
+}
+[data-theme="dark"] .badge.badge-info {
+  background-color: rgba(255, 214, 10, 0.12);
+  color: var(--brand-yellow);
+  border-color: rgba(255, 214, 10, 0.34);
 }
 
 /* ─── 9. Card Component (Apple Glass Surfaces) ─────────────── */
@@ -1118,6 +1142,18 @@ button, input, select, textarea {
   max-width: 72px;
 }
 
+.step.passed .step-dot {
+  background-color: var(--brand-primary);
+  border-color: var(--brand-primary);
+  color: #ffffff;
+}
+[data-theme="dark"] .step.passed .step-dot {
+  color: #050507;
+}
+.step.passed .step-label {
+  color: var(--text-primary);
+}
+
 .step.active .step-dot {
   background-color: var(--brand-yellow);
   border-color: var(--brand-yellow-bright);
@@ -1457,7 +1493,8 @@ input[type="range"] {
 /* ─── 20. Tables & Pagination ───────────────────────────────── */
 .table-responsive {
   width: 100%;
-  overflow-x: auto;
+  max-height: 540px;
+  overflow: auto;
   border: 1px solid var(--border-color);
   border-radius: var(--radius-md);
   background-color: var(--card-bg);
@@ -1471,6 +1508,9 @@ input[type="range"] {
 }
 
 .data-table th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
   background-color: #0b0b0e;
   color: var(--brand-yellow);
   font-weight: 700;
@@ -1668,6 +1708,7 @@ input[type="range"] {
     color: #000000 !important;
   }
   .ambient-glow,
+  .top-chrome,
   .app-header,
   .tabs-nav-bar,
   #alert-banner,
@@ -1755,8 +1796,13 @@ input[type="range"] {
   .main-content {
     padding: 1rem 0.85rem;
   }
-  .brand-chip {
+  .brand-chip,
+  .brand-subtitle {
     display: none;
+  }
+  .header-container {
+    gap: 0.55rem;
+    padding: 0.55rem 0.85rem;
   }
 }
 

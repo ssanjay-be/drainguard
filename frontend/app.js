@@ -568,6 +568,14 @@
       });
     }
 
+    if (modal) {
+      modal.addEventListener('click', (e) => {
+        if (e.target === modal) {
+          modal.hidden = true;
+        }
+      });
+    }
+
     if (form) {
       form.addEventListener('submit', async (e) => {
         e.preventDefault();
@@ -1662,8 +1670,8 @@
           const isActive = s.id === activeId;
           const isPassed = activeIndex > idx;
           return `
-            <div class="step ${isActive ? 'active' : ''}" title="${s.label}: ${s.desc}">
-              <div class="step-dot" style="${isPassed ? 'background: var(--brand-primary); color: #fff; border-color: var(--brand-primary);' : ''}">
+            <div class="step ${isActive ? 'active' : (isPassed ? 'passed' : '')}" title="${s.label}: ${s.desc}">
+              <div class="step-dot">
                 ${isPassed ? '✓' : idx + 1}
               </div>
               <span class="step-label">${s.label}</span>
@@ -3813,12 +3821,14 @@
     if (closeBtn && backdrop) {
       closeBtn.onclick = () => {
         backdrop.classList.remove('open');
+        backdrop.setAttribute('aria-hidden', 'true');
       };
     }
     if (backdrop) {
       backdrop.onclick = (e) => {
         if (e.target === backdrop) {
           backdrop.classList.remove('open');
+          backdrop.setAttribute('aria-hidden', 'true');
         }
       };
     }
@@ -3835,6 +3845,7 @@
 
     title.textContent = `Event #${eventItem.id} Details`;
     backdrop.classList.add('open');
+    backdrop.setAttribute('aria-hidden', 'false');
 
     content.innerHTML = `
       <div style="margin-bottom: 1rem;">
@@ -4433,6 +4444,20 @@
     initAdminAuth();
     initNavigation();
     loadInitialData();
+
+    // Global Escape key dismissal for Admin Modal & History Detail Drawer
+    document.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      const modal = document.getElementById('admin-modal');
+      if (modal && !modal.hidden) {
+        modal.hidden = true;
+      }
+      const drawer = document.getElementById('history-drawer-backdrop');
+      if (drawer && drawer.classList.contains('open')) {
+        drawer.classList.remove('open');
+        drawer.setAttribute('aria-hidden', 'true');
+      }
+    });
 
     // Debounced resize handler for charts
     let resizeTimer;

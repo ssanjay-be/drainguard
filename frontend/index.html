@@ -40,91 +40,94 @@
   <!-- Ambient Top Dual-Tone Lighting -->
   <div class="ambient-glow" aria-hidden="true"></div>
 
-  <!-- ─── 1. Header Bar ───────────────────────────────────────── -->
-  <header class="app-header">
-    <div class="header-container">
-      <!-- Brand & Title -->
-      <div class="brand-wrapper">
-        <div class="brand-emblem" aria-hidden="true">
-          <span class="brand-logo">🌧️</span>
-        </div>
-        <div>
-          <div class="brand-title-row">
-            <h1 class="brand-title">DrainGuard</h1>
-            <span class="brand-chip">LIVE TELEMETRY</span>
+  <!-- ─── 1–4. Unified Sticky Top Chrome (Header + Banners + Tabs) ─ -->
+  <div class="top-chrome">
+    <!-- ─── 1. Header Bar ───────────────────────────────────────── -->
+    <header class="app-header">
+      <div class="header-container">
+        <!-- Brand & Title -->
+        <div class="brand-wrapper">
+          <div class="brand-emblem" aria-hidden="true">
+            <span class="brand-logo">🌧️</span>
           </div>
-          <span class="brand-subtitle">Predictive Stormwater Clog Diagnostic</span>
+          <div>
+            <div class="brand-title-row">
+              <h1 class="brand-title">DrainGuard</h1>
+              <span class="brand-chip">LIVE TELEMETRY</span>
+            </div>
+            <span class="brand-subtitle">Predictive Stormwater Clog Diagnostic</span>
+          </div>
+        </div>
+
+        <!-- Controls & Status -->
+        <div class="header-controls">
+          <!-- Device Selector -->
+          <div class="device-select-wrapper" title="Select monitored drain unit">
+            <label for="device-select" class="device-select-label">Unit</label>
+            <select id="device-select" class="device-select" aria-label="Select device">
+              <option value="">Connecting...</option>
+            </select>
+          </div>
+
+          <!-- Online Status Indicator -->
+          <div class="online-status-pill" title="Heartbeat telemetry status">
+            <span id="online-dot" class="online-dot offline"></span>
+            <span id="last-seen-text">Checking...</span>
+          </div>
+
+          <!-- Theme Toggle (Dark Obsidian / Light Gold) -->
+          <button id="theme-toggle" class="btn-icon" aria-label="Toggle dark or light theme" title="Toggle Obsidian / Daylight theme">
+            <span id="theme-icon">🌙</span>
+          </button>
+
+          <!-- Admin Mode Button / Lock -->
+          <button id="admin-lock-btn" class="btn-icon" aria-label="Admin settings mode" title="Admin lock (Click to unlock)">
+            <span id="admin-icon">🔒</span>
+            <span id="admin-badge" class="badge">Read-only</span>
+          </button>
         </div>
       </div>
+    </header>
 
-      <!-- Controls & Status -->
-      <div class="header-controls">
-        <!-- Device Selector -->
-        <div class="device-select-wrapper" title="Select monitored drain unit">
-          <label for="device-select" class="device-select-label">Unit</label>
-          <select id="device-select" class="device-select" aria-label="Select device">
-            <option value="">Connecting...</option>
-          </select>
-        </div>
+    <!-- ─── 2. Critical Alert Banner ────────────────────────────── -->
+    <div id="alert-banner" hidden role="alert" aria-live="assertive">
+      <div class="alert-banner-content">
+        <span>🚨</span>
+        <span id="alert-banner-text">Critical clog or flood alert active on selected drain!</span>
+      </div>
+      <button id="alert-banner-action" class="alert-banner-btn">View Alerts</button>
+    </div>
 
-        <!-- Online Status Indicator -->
-        <div class="online-status-pill" title="Heartbeat telemetry status">
-          <span id="online-dot" class="online-dot offline"></span>
-          <span id="last-seen-text">Checking...</span>
-        </div>
+    <!-- ─── 3. Cold-Start Server Wakeup Message (Hidden unless >2s) ─ -->
+    <div id="cold-start-msg" hidden role="status">
+      <span class="spinner" aria-hidden="true"></span>
+      <span>Waking telemetry server... live data will appear momentarily.</span>
+    </div>
 
-        <!-- Theme Toggle (Dark Obsidian / Light Gold) -->
-        <button id="theme-toggle" class="btn-icon" aria-label="Toggle dark or light theme" title="Toggle Obsidian / Daylight theme">
-          <span id="theme-icon">🌙</span>
+    <!-- ─── 4. Navigation Tab Bar ───────────────────────────────── -->
+    <nav class="tabs-nav-bar" aria-label="Main Navigation">
+      <div class="tabs-container" role="tablist">
+        <button class="tab-btn active" data-tab="overview" role="tab" aria-selected="true" id="tab-btn-overview">
+          <span class="tab-icon">📊</span> Overview
         </button>
-
-        <!-- Admin Mode Button / Lock -->
-        <button id="admin-lock-btn" class="btn-icon" aria-label="Admin settings mode" title="Admin lock (Click to unlock)">
-          <span id="admin-icon">🔒</span>
-          <span id="admin-badge" class="badge">Read-only</span>
+        <button class="tab-btn" data-tab="analytics" role="tab" aria-selected="false" id="tab-btn-analytics">
+          <span class="tab-icon">📈</span> Analytics
+        </button>
+        <button class="tab-btn" data-tab="trends" role="tab" aria-selected="false" id="tab-btn-trends">
+          <span class="tab-icon">📉</span> Trends
+        </button>
+        <button class="tab-btn" data-tab="history" role="tab" aria-selected="false" id="tab-btn-history">
+          <span class="tab-icon">📜</span> History
+        </button>
+        <button class="tab-btn" data-tab="alerts" role="tab" aria-selected="false" id="tab-btn-alerts">
+          <span class="tab-icon">🔔</span> Alerts
+        </button>
+        <button class="tab-btn" data-tab="settings" role="tab" aria-selected="false" id="tab-btn-settings">
+          <span class="tab-icon">⚙️</span> Settings
         </button>
       </div>
-    </div>
-  </header>
-
-  <!-- ─── 2. Sticky Critical Alert Banner ─────────────────────── -->
-  <div id="alert-banner" hidden role="alert" aria-live="assertive">
-    <div class="alert-banner-content">
-      <span>🚨</span>
-      <span id="alert-banner-text">Critical clog or flood alert active on selected drain!</span>
-    </div>
-    <button id="alert-banner-action" class="alert-banner-btn">View Alerts</button>
+    </nav>
   </div>
-
-  <!-- ─── 3. Cold-Start Server Wakeup Message (Hidden unless >2s) ─ -->
-  <div id="cold-start-msg" hidden role="status">
-    <span class="spinner" aria-hidden="true"></span>
-    <span>Waking telemetry server... live data will appear momentarily.</span>
-  </div>
-
-  <!-- ─── 4. Navigation Tab Bar ───────────────────────────────── -->
-  <nav class="tabs-nav-bar" aria-label="Main Navigation">
-    <div class="tabs-container" role="tablist">
-      <button class="tab-btn active" data-tab="overview" role="tab" aria-selected="true" id="tab-btn-overview">
-        <span class="tab-icon">📊</span> Overview
-      </button>
-      <button class="tab-btn" data-tab="analytics" role="tab" aria-selected="false" id="tab-btn-analytics">
-        <span class="tab-icon">📈</span> Analytics
-      </button>
-      <button class="tab-btn" data-tab="trends" role="tab" aria-selected="false" id="tab-btn-trends">
-        <span class="tab-icon">📉</span> Trends
-      </button>
-      <button class="tab-btn" data-tab="history" role="tab" aria-selected="false" id="tab-btn-history">
-        <span class="tab-icon">📜</span> History
-      </button>
-      <button class="tab-btn" data-tab="alerts" role="tab" aria-selected="false" id="tab-btn-alerts">
-        <span class="tab-icon">🔔</span> Alerts
-      </button>
-      <button class="tab-btn" data-tab="settings" role="tab" aria-selected="false" id="tab-btn-settings">
-        <span class="tab-icon">⚙️</span> Settings
-      </button>
-    </div>
-  </nav>
 
   <!-- ─── 5. Tab Panels Container ─────────────────────────────── -->
   <main class="main-content">
