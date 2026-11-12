@@ -9,6 +9,7 @@
 
 const express  = require('express');
 const supabase = require('../lib/supabase');
+const { deriveEventsFromReadings } = require('./analytics');
 
 const router = express.Router();
 
@@ -119,7 +120,7 @@ router.get('/:id/overview', async (req, res, next) => {
         .select('*')
         .eq('device_id', id)
         .order('created_at', { ascending: false })
-        .limit(30),
+        .limit(120),
       supabase
         .from('rod_events')
         .select('*')
@@ -168,14 +169,48 @@ router.get('/:id/overview', async (req, res, next) => {
       ? (Date.now() - lastSeen.getTime()) < offlineAfterMin * 60 * 1000
       : false;
 
-    // ── Compute Health Score (0-100) ──────────────────────
-    let healthScore = 50;
-    if (latestRodEvent) {
-      healthScore = Math.round((latestRodEvent.ratio ?? 0.5) * 100);
-      healthScore = Math.min(100, Math.max(0, healthScore));
+    // ── Derive fallback RoD event & today cycle count from telemetry ──
+    const derivedEvents = deriveEventsFromReadings(recentReadings, config);
+    const derivedRodEvent = derivedEvents.length > 0 ? derivedEvents[derivedEvents.length - 1] : null;
+    const effectiveRod = latestRodEvent || derivedRodEvent;
+    const todayDerivedCount = derivedEvents.filter(e => e.created_at >= todayIso).length;
+
+    // ── Compute live trailing slope (cm/min) ──────────────
+    const chronological = [...recentReadings].reverse().filter(r => r.water_cm != null && r.created_at);
+    let liveSlopeCmMin = 0;
+    if (chronological.length >= 2) {
+      const tail = chronological.slice(-8);
+      const t0 = new Date(tail[0].created_at).getTime();
+      const dtMin = (new Date(tail[tail.length - 1].created_at).getTime() - t0) / 60000;
+      if (dtMin >= 0.05) {
+        liveSlopeCmMin = (Number(tail[tail.length - 1].water_cm) - Number(tail[0].water_cm)) / dtMin;
+      }
     }
-    if (!online) {
-      healthScore = Math.max(0, healthScore - 10);
+
+    // ── Compute Dynamic Health Score (0-100) ──────────────
+    const sensorToBottom = Number(config.sensor_to_bottom_cm) || 60;
+    const rainStart = Number(config.rain_start_cm) || 10;
+    const currentWater = Number(latestReading?.water_cm ?? 0);
+    const fillRatio = Math.min(1, Math.max(0, currentWater / sensorToBottom));
+
+    const velPts = effectiveRod && effectiveRod.ratio != null
+      ? Math.min(45, Math.max(5, Math.round(Number(effectiveRod.ratio) * 45)))
+      : (currentWater <= rainStart ? 42 : 34);
+    const clearPts = (latestReading?.flood_risk || fillRatio >= 0.9)
+      ? 0
+      : Math.round((1 - fillRatio) * 35);
+
+    let flowPts = 20;
+    if (currentWater > rainStart && liveSlopeCmMin > -0.15) {
+      flowPts -= Math.min(14, Math.round(((currentWater - rainStart) / Math.max(1, sensorToBottom - rainStart)) * 14));
+    } else if (liveSlopeCmMin >= 0.5) {
+      flowPts -= 3;
+    }
+    if (!online) flowPts -= 10;
+
+    let healthScore = Math.min(100, Math.max(0, velPts + clearPts + Math.max(0, flowPts)));
+    if (latestReading?.flood_risk) {
+      healthScore = Math.min(healthScore, 20);
     }
 
     // ── Build and send response ───────────────────────────
@@ -187,12 +222,14 @@ router.get('/:id/overview', async (req, res, next) => {
       online,
       last_seen:         device.last_seen,
       latest_rod_event:  latestRodEvent,
+      derived_rod_event: derivedRodEvent,
+      live_slope_cm_min: Number(liveSlopeCmMin.toFixed(3)),
       baseline_rod:      config.baseline_rod ?? null,
       health_score:      healthScore,
       current_state:     latestReading?.state ?? null,
       open_alerts:       openAlertsRes.data || [],
       open_alert_count:  openAlertsRes.count ?? 0,
-      today_rain_events: todayRainRes.count ?? 0,
+      today_rain_events: Math.max(todayRainRes.count ?? 0, todayDerivedCount),
       today_alerts:      todayAlertsRes.count ?? 0,
     });
 

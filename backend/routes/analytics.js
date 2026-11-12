@@ -48,7 +48,7 @@ function deriveEventsFromReadings(readings, config = {}) {
       segEnd = curr;
       steadySteps = 0;
     } else if (segStart) {
-      if (Math.abs(dw) <= 0.15 && ++steadySteps < 2) {
+      if (dw >= -0.25 && ++steadySteps < 2) {
         segEnd = curr;
       } else {
         pushSegment(segStart, segEnd);
@@ -346,6 +346,23 @@ router.get('/trend', async (req, res, next) => {
     const chronologicalReadings = [...(readingsRes.data || [])].reverse();
     const waterSeries = downsampleReadings(chronologicalReadings, 120);
 
+    // Compute dH/dt velocity series (cm/min) across waterSeries so Trends shows dynamic flow rates even between RoD events
+    const velocitySeries = [];
+    for (let i = 1; i < waterSeries.length; i++) {
+      const prev = waterSeries[i - 1];
+      const curr = waterSeries[i];
+      const dtMin = (new Date(curr.created_at) - new Date(prev.created_at)) / 60000;
+      if (dtMin > 0.02 && prev.water_cm != null && curr.water_cm != null) {
+        const rate = (Number(curr.water_cm) - Number(prev.water_cm)) / dtMin;
+        velocitySeries.push({
+          time:        curr.created_at,
+          created_at:  curr.created_at,
+          rate_cm_min: Number(Math.max(-50, Math.min(50, rate)).toFixed(3)),
+          water_cm:    curr.water_cm,
+        });
+      }
+    }
+
     // Use reliable hardware rod_events if >= 2; otherwise fall back to all rod_events or readings-derived cycles
     const reliableHardware = hardwareEvents.filter(e => !e.low_confidence);
     const derivedEvents = deriveEventsFromReadings(chronologicalReadings, config);
@@ -389,6 +406,7 @@ router.get('/trend', async (req, res, next) => {
       return res.json({
         events,
         water_series:                 waterSeries,
+        velocity_series:              velocitySeries,
         reading_count:                waters.length,
         avg_water_cm:                 avgWater != null ? Number(avgWater.toFixed(2)) : null,
         peak_water_cm:                peakWater != null ? Number(peakWater.toFixed(2)) : null,
@@ -453,6 +471,7 @@ router.get('/trend', async (req, res, next) => {
     res.json({
       events,
       water_series:                 waterSeries,
+      velocity_series:              velocitySeries,
       reading_count:                waters.length,
       avg_water_cm:                 avgWater != null ? Number(avgWater.toFixed(2)) : null,
       peak_water_cm:                peakWater != null ? Number(peakWater.toFixed(2)) : null,
@@ -466,5 +485,7 @@ router.get('/trend', async (req, res, next) => {
     next(err);
   }
 });
+
+router.deriveEventsFromReadings = deriveEventsFromReadings;
 
 module.exports = router;

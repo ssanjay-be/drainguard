@@ -656,9 +656,9 @@
       panel.classList.toggle('active', panel.id === `tab-${tabName}`);
     });
 
-    // Manage overview polling based on active tab
-    if (tabName === 'overview') {
-      startOverviewPolling();
+    // Manage live polling based on active tab (Overview 5s, Trends 10s silent)
+    if (tabName === 'overview' || tabName === 'trends') {
+      startOverviewPolling(tabName);
     } else {
       stopOverviewPolling();
     }
@@ -668,12 +668,16 @@
     }
   }
 
-  function startOverviewPolling() {
+  function startOverviewPolling(mode = 'overview') {
     stopOverviewPolling();
-    const interval = (window.APP_CONFIG && window.APP_CONFIG.POLL_INTERVAL_MS) || 5000;
+    const baseInterval = (window.APP_CONFIG && window.APP_CONFIG.POLL_INTERVAL_MS) || 5000;
+    const interval = mode === 'trends' ? Math.max(baseInterval * 2, 10000) : baseInterval;
     state.pollIntervalId = setInterval(() => {
-      if (state.activeTab === 'overview' && !document.hidden && state.currentDeviceId) {
+      if (document.hidden || !state.currentDeviceId) return;
+      if (state.activeTab === 'overview') {
         fetchOverviewData(true);
+      } else if (state.activeTab === 'trends') {
+        renderTrendsTab(true);
       }
     }, interval);
   }
@@ -884,10 +888,17 @@
         open_alerts: data.open_alert_count !== undefined ? data.open_alert_count : alertsList.length
       };
 
+      const isDeviceOnline = data.online !== undefined
+        ? Boolean(data.online)
+        : (device.last_seen ? ((Date.now() - new Date(device.last_seen).getTime()) < ((config.offline_after_min || 15) * 60 * 1000)) : false);
+
       const normalizedData = {
         device,
         reading,
         rod_event: rodEvent,
+        derived_rod_event: data.derived_rod_event || null,
+        live_slope_cm_min: data.live_slope_cm_min,
+        online: isDeviceOnline,
         config,
         recent_readings: recentReadings,
         today: todayCounters,
@@ -996,7 +1007,8 @@
     const config = data.config || {};
     const recentReadings = data.recent_readings || [];
     const todayCounters = data.today || {};
-    const healthScore = calculateHealthScore(rodEvent, reading);
+    const dynamics = analyzeLiveDrainDynamics(data);
+    const health = calculateHealthScore(dynamics);
 
     renderedOverviewDeviceId = device.id || state.currentDeviceId;
 
@@ -1019,7 +1031,7 @@
         <div style="display: flex; flex-direction: column; gap: 1.25rem;">
           <!-- Primary Status Card -->
           <div id="overview-status-slot">
-            ${renderStatusCardHTML(rodEvent, reading)}
+            ${renderStatusCardHTML(rodEvent, reading, dynamics)}
           </div>
 
           <!-- State Machine Stepper -->
@@ -1029,7 +1041,7 @@
               <span class="card-subtitle">Real-time Cycle</span>
             </div>
             <div id="overview-stepper-slot">
-              ${renderStateStepperHTML(reading.state || 'IDLE')}
+              ${renderStateStepperHTML(dynamics.effectiveState || reading.state || 'IDLE')}
             </div>
           </div>
 
@@ -1056,10 +1068,10 @@
           <div class="card">
             <div class="card-header">
               <h3 class="card-title"><span>⏱️</span> Rate of Drop (ROD)</h3>
-              <span class="card-subtitle">Drainage Velocity</span>
+              <span class="card-subtitle" id="overview-gauge-subtitle">${escapeHTML(dynamics.gaugeSubtitle)}</span>
             </div>
             <div id="overview-gauge-slot">
-              ${renderRodGaugeHTML(rodEvent)}
+              ${renderRodGaugeHTML(rodEvent, dynamics)}
             </div>
           </div>
 
@@ -1067,10 +1079,10 @@
           <div class="card">
             <div class="card-header">
               <h3 class="card-title"><span>❤️</span> Drain Health Score</h3>
-              <span class="card-subtitle">Predictive Index</span>
+              <span class="card-subtitle">Live Composite Index</span>
             </div>
             <div id="overview-health-slot">
-              ${renderHealthScoreHTML(healthScore)}
+              ${renderHealthScoreHTML(health)}
             </div>
           </div>
         </div>
@@ -1130,16 +1142,17 @@
     const config = data.config || {};
     const recentReadings = data.recent_readings || [];
     const todayCounters = data.today || {};
-    const healthScore = calculateHealthScore(rodEvent, reading);
+    const dynamics = analyzeLiveDrainDynamics(data);
+    const health = calculateHealthScore(dynamics);
 
     const tankEl = document.getElementById('tank-visual-container');
     if (tankEl) tankEl.innerHTML = renderDrainTankHTML(reading, config);
 
     const statusEl = document.getElementById('overview-status-slot');
-    if (statusEl) statusEl.innerHTML = renderStatusCardHTML(rodEvent, reading);
+    if (statusEl) statusEl.innerHTML = renderStatusCardHTML(rodEvent, reading, dynamics);
 
     const stepperEl = document.getElementById('overview-stepper-slot');
-    if (stepperEl) stepperEl.innerHTML = renderStateStepperHTML(reading.state || 'IDLE');
+    if (stepperEl) stepperEl.innerHTML = renderStateStepperHTML(dynamics.effectiveState || reading.state || 'IDLE');
 
     const rainEl = document.getElementById('kpi-rain-today');
     if (rainEl) rainEl.textContent = todayCounters.rain_events || 0;
@@ -1151,11 +1164,14 @@
       alertEl.style.color = count > 0 ? 'var(--color-preclog)' : 'var(--color-clear)';
     }
 
+    const gaugeSubEl = document.getElementById('overview-gauge-subtitle');
+    if (gaugeSubEl) gaugeSubEl.textContent = dynamics.gaugeSubtitle;
+
     const gaugeEl = document.getElementById('overview-gauge-slot');
-    if (gaugeEl) gaugeEl.innerHTML = renderRodGaugeHTML(rodEvent);
+    if (gaugeEl) gaugeEl.innerHTML = renderRodGaugeHTML(rodEvent, dynamics);
 
     const healthEl = document.getElementById('overview-health-slot');
-    if (healthEl) healthEl.innerHTML = renderHealthScoreHTML(healthScore);
+    if (healthEl) healthEl.innerHTML = renderHealthScoreHTML(health);
 
     // Update Device Telemetry text values WITHOUT destroying #device-mini-map
     const barsCount = rssiToBars(reading && reading.rssi);
@@ -1191,25 +1207,282 @@
   }
 
   /**
-   * Computes composite health score (0 - 100)
-   * Factors in: RoD ratio against baseline, flood risk state, sensor confidence
+   * Analyzes live recent_readings alongside hardware rod_events so RoD Gauge,
+   * Drain Health Score, and Status react immediately to every 5s sensor update.
    */
-  function calculateHealthScore(rodEvent, reading) {
-    if (reading && reading.flood_risk) return 15; // Critical flood risk
+  function analyzeLiveDrainDynamics(data) {
+    const reading = (data && data.reading) || {};
+    const rodEvent = (data && data.rod_event) || {};
+    const derivedBackend = (data && data.derived_rod_event) || null;
+    const config = (data && data.config) || {};
+    const recentReadings = Array.isArray(data && data.recent_readings) ? data.recent_readings : [];
+    const online = data && data.online !== undefined ? Boolean(data.online) : true;
 
-    const ratio = rodEvent && rodEvent.ratio !== undefined ? rodEvent.ratio : 1.0;
-    if (ratio === null || isNaN(ratio)) return 100;
+    const sensorToBottom = Number(config.sensor_to_bottom_cm) || 60;
+    const rainStart = Number(config.rain_start_cm) || 10;
+    const baselineRod = Number(config.baseline_rod) > 0
+      ? Number(config.baseline_rod)
+      : (rodEvent && Number(rodEvent.baseline_rod) > 0 ? Number(rodEvent.baseline_rod) : 2.5);
+    const clearRatio = Number(config.clear_ratio) || 0.8;
+    const preclogRatio = Number(config.preclog_ratio) || 0.5;
 
-    // Normal ratio >= 0.8 => 85-100 score
-    if (ratio >= 0.8) {
-      return Math.min(100, Math.round(80 + (ratio - 0.8) * 100));
+    const stream = recentReadings.filter(r => r && r.water_cm != null && r.created_at);
+    if (reading && reading.water_cm != null && reading.created_at) {
+      const exists = stream.some(r => r.created_at === reading.created_at);
+      if (!exists) stream.push(reading);
     }
-    // Watch ratio 0.5 to 0.8 => 50-79 score
-    if (ratio >= 0.5) {
-      return Math.round(50 + ((ratio - 0.5) / 0.3) * 29);
+    stream.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+    const currentWater = reading && reading.water_cm != null
+      ? Math.max(0, Number(reading.water_cm))
+      : (stream.length > 0 ? Math.max(0, Number(stream[stream.length - 1].water_cm)) : 0);
+    const fillRatio = Math.min(1, Math.max(0, currentWater / sensorToBottom));
+    const clearancePct = Math.round((1 - fillRatio) * 100);
+
+    let liveSlopeCmMin = 0;
+    let windowStartWater = currentWater;
+    let windowMaxWater = currentWater;
+    let windowDurationS = 0;
+
+    if (stream.length >= 2) {
+      const tail = stream.slice(-8);
+      windowStartWater = Number(tail[0].water_cm);
+      windowMaxWater = Math.max(...tail.map(r => Number(r.water_cm)));
+      const t0 = new Date(tail[0].created_at).getTime();
+      windowDurationS = Math.max(0, Math.round((new Date(tail[tail.length - 1].created_at).getTime() - t0) / 1000));
+
+      if (windowDurationS >= 4) {
+        let sumT = 0, sumW = 0, sumTW = 0, sumT2 = 0;
+        for (let i = 0; i < tail.length; i++) {
+          const tMin = (new Date(tail[i].created_at).getTime() - t0) / 60000;
+          const w = Number(tail[i].water_cm);
+          sumT += tMin; sumW += w; sumTW += tMin * w; sumT2 += tMin * tMin;
+        }
+        const denom = tail.length * sumT2 - sumT * sumT;
+        if (denom > 1e-6) {
+          liveSlopeCmMin = (tail.length * sumTW - sumT * sumW) / denom;
+        }
+      }
     }
-    // Pre-clog ratio < 0.5 => 10-49 score
-    return Math.max(10, Math.round(ratio * 90));
+
+    let telemetryDrop = derivedBackend;
+    if (!telemetryDrop && stream.length >= 3) {
+      let segStart = null, segEnd = null, steady = 0;
+      let latest = null;
+      const checkSeg = (s, e) => {
+        if (!s || !e) return;
+        const drop = Number(s.water_cm) - Number(e.water_cm);
+        const durS = (new Date(e.created_at) - new Date(s.created_at)) / 1000;
+        if (drop >= 0.35 && durS >= 4) {
+          const rod = drop / (durS / 60);
+          const ratio = baselineRod > 0 ? rod / baselineRod : 1.0;
+          let status = 'CLEAR';
+          if (ratio < preclogRatio) status = 'PRE_CLOG';
+          else if (ratio < clearRatio) status = 'WATCH';
+          latest = {
+            created_at: e.created_at,
+            h1_cm: Number(s.water_cm),
+            h2_cm: Number(e.water_cm),
+            duration_s: Math.round(durS),
+            rod_cm_min: Number(rod.toFixed(2)),
+            baseline_rod: baselineRod,
+            ratio: Number(ratio.toFixed(3)),
+            status,
+            derived: true
+          };
+        }
+      };
+      for (let i = 1; i < stream.length; i++) {
+        const dw = Number(stream[i - 1].water_cm) - Number(stream[i].water_cm);
+        if (dw > 0.15) {
+          if (!segStart) segStart = stream[i - 1];
+          segEnd = stream[i];
+          steady = 0;
+        } else if (segStart) {
+          if (dw >= -0.25 && ++steady < 2) {
+            segEnd = stream[i];
+          } else {
+            checkSeg(segStart, segEnd);
+            segStart = null; segEnd = null; steady = 0;
+          }
+        }
+      }
+      if (segStart && segEnd) checkSeg(segStart, segEnd);
+      telemetryDrop = latest;
+    }
+
+    const hasHwRod = Boolean(rodEvent && rodEvent.rod_cm_min !== undefined && rodEvent.rod_cm_min !== null);
+
+    let mode = 'STEADY';
+    let gaugeRatio = clearancePct / 100;
+    let gaugePercent = clearancePct;
+    let measuredRodCmMin = 0;
+    let h1Cm = windowStartWater;
+    let h2Cm = currentWater;
+    let durationS = windowDurationS;
+    let gaugeSubtitle = 'Steady Dry Clearance';
+    let effectiveStatus = (rodEvent && rodEvent.status) || 'CLEAR';
+    let rodRatioForHealth = null;
+
+    if (liveSlopeCmMin <= -0.25) {
+      mode = 'ACTIVE_DROP';
+      measuredRodCmMin = Math.abs(liveSlopeCmMin);
+      gaugeRatio = baselineRod > 0 ? measuredRodCmMin / baselineRod : 1.0;
+      gaugePercent = Math.round(gaugeRatio * 100);
+      h1Cm = windowMaxWater;
+      h2Cm = currentWater;
+      durationS = windowDurationS;
+      gaugeSubtitle = 'Live Active Draining';
+      rodRatioForHealth = gaugeRatio;
+      if (gaugeRatio < preclogRatio) effectiveStatus = 'PRE_CLOG';
+      else if (gaugeRatio < clearRatio) effectiveStatus = 'WATCH';
+      else effectiveStatus = 'CLEAR';
+    } else if (liveSlopeCmMin >= 0.25) {
+      mode = 'RISING';
+      measuredRodCmMin = liveSlopeCmMin;
+      gaugeRatio = Math.max(0.05, clearancePct / 100);
+      gaugePercent = clearancePct;
+      h1Cm = windowStartWater;
+      h2Cm = currentWater;
+      durationS = windowDurationS;
+      gaugeSubtitle = 'Water Rising (Inflow)';
+      if (currentWater >= sensorToBottom * 0.85) effectiveStatus = 'WATCH';
+    } else if (hasHwRod) {
+      mode = 'HARDWARE_EVENT';
+      measuredRodCmMin = Number(rodEvent.rod_cm_min);
+      gaugeRatio = Number(rodEvent.ratio ?? 1.0);
+      gaugePercent = Math.round(gaugeRatio * 100);
+      h1Cm = Number(rodEvent.h1_cm ?? currentWater);
+      h2Cm = Number(rodEvent.h2_cm ?? currentWater);
+      durationS = Number(rodEvent.duration_s ?? 0);
+      gaugeSubtitle = 'Verified Hardware Cycle';
+      effectiveStatus = rodEvent.status || 'CLEAR';
+      rodRatioForHealth = gaugeRatio;
+    } else if (telemetryDrop) {
+      mode = 'DERIVED_DROP';
+      measuredRodCmMin = Number(telemetryDrop.rod_cm_min);
+      gaugeRatio = Number(telemetryDrop.ratio);
+      gaugePercent = Math.round(gaugeRatio * 100);
+      h1Cm = telemetryDrop.h1_cm;
+      h2Cm = telemetryDrop.h2_cm;
+      durationS = telemetryDrop.duration_s;
+      gaugeSubtitle = 'Telemetry Drop Cycle';
+      effectiveStatus = telemetryDrop.status;
+      rodRatioForHealth = gaugeRatio;
+    } else {
+      gaugeSubtitle = currentWater > rainStart ? 'Standing Water · 0.00 cm/min' : 'Steady Clearance';
+      if (currentWater >= sensorToBottom * 0.75) effectiveStatus = 'WATCH';
+    }
+
+    let effectiveState = String((reading && reading.state) || 'IDLE').toUpperCase();
+    if ((effectiveState === 'IDLE' || effectiveState === 'DRY') && currentWater >= rainStart) {
+      if (mode === 'RISING') effectiveState = 'RAIN';
+      else if (mode === 'ACTIVE_DROP') effectiveState = 'ROD';
+      else effectiveState = 'PEAK';
+    }
+
+    return {
+      mode,
+      online,
+      reading,
+      currentWater,
+      sensorToBottom,
+      rainStart,
+      fillRatio,
+      clearancePct,
+      liveSlopeCmMin,
+      baselineRod,
+      measuredRodCmMin,
+      gaugeRatio,
+      gaugePercent,
+      h1Cm,
+      h2Cm,
+      durationS,
+      gaugeSubtitle,
+      effectiveStatus,
+      effectiveState,
+      rodRatioForHealth,
+      floodRisk: Boolean(reading && reading.flood_risk) || fillRatio >= 0.9,
+      hasTelemetry: stream.length > 0
+    };
+  }
+
+  /**
+   * Computes dynamic composite Drain Health Score (0 - 100) from real sensor readings & RoD
+   */
+  function calculateHealthScore(dynamics) {
+    if (!dynamics) {
+      return { score: 0, label: 'No Telemetry', color: 'var(--text-muted)', summary: 'Awaiting telemetry.', chips: [] };
+    }
+
+    const {
+      online,
+      currentWater,
+      sensorToBottom,
+      rainStart,
+      fillRatio,
+      clearancePct,
+      liveSlopeCmMin,
+      mode,
+      measuredRodCmMin,
+      rodRatioForHealth,
+      floodRisk
+    } = dynamics;
+
+    const velPts = rodRatioForHealth !== null
+      ? Math.min(45, Math.max(5, Math.round(rodRatioForHealth * 45)))
+      : (currentWater <= rainStart ? 42 : 34);
+
+    const clearPts = floodRisk ? 0 : Math.round((1 - fillRatio) * 35);
+
+    let flowPts = 20;
+    if (currentWater > rainStart && liveSlopeCmMin > -0.15) {
+      flowPts -= Math.min(14, Math.round(((currentWater - rainStart) / Math.max(1, sensorToBottom - rainStart)) * 14));
+    } else if (liveSlopeCmMin >= 0.25) {
+      flowPts -= Math.min(8, Math.round(liveSlopeCmMin * 2));
+    }
+    if (!online) flowPts -= 10;
+
+    let score = Math.min(100, Math.max(0, velPts + clearPts + Math.max(0, flowPts)));
+    if (floodRisk) score = Math.min(score, 20);
+
+    let color = 'var(--color-clear)';
+    let label = 'Optimal Condition';
+    let summary = 'Clearance and hydraulic capacity are healthy with zero restriction.';
+
+    if (floodRisk || score < 50) {
+      color = 'var(--color-preclog)';
+      label = floodRisk ? 'Critical Flood Risk' : 'Severe Clog / Load Risk';
+      summary = floodRisk
+        ? 'Water depth exceeds 90% capacity — immediate surcharge inspection required.'
+        : 'High water load or slowed drainage velocity detected from live telemetry.';
+    } else if (score < 80) {
+      color = 'var(--color-watch)';
+      label = mode === 'RISING' ? 'Active Inflow Load' : 'Watch: Reduced Margin';
+      summary = mode === 'RISING'
+        ? `Water rising (+${liveSlopeCmMin.toFixed(1)} cm/min) — health reflects reduced capacity margin.`
+        : 'Moderate water level or slowed drainage ratio; monitor recovery.';
+    } else if (mode === 'ACTIVE_DROP') {
+      summary = `Water actively draining at ${measuredRodCmMin.toFixed(2)} cm/min with strong clearance.`;
+    }
+
+    const velChip = mode === 'RISING'
+      ? `Inflow: +${liveSlopeCmMin.toFixed(2)} cm/min`
+      : (mode === 'ACTIVE_DROP' || mode === 'HARDWARE_EVENT' || mode === 'DERIVED_DROP')
+        ? `RoD: ${measuredRodCmMin.toFixed(2)} cm/min`
+        : 'Rate: 0.00 cm/min';
+
+    return {
+      score,
+      label,
+      color,
+      summary,
+      chips: [
+        `Clearance: ${clearancePct}%`,
+        `Depth: ${currentWater.toFixed(1)} cm`,
+        velChip
+      ]
+    };
   }
 
   /**
@@ -1276,19 +1549,21 @@
   }
 
   /**
-   * Component 2: Status Card HTML
+   * Component 2: Status Card HTML (responsive to live inflow, active drops, standing water, and RoD events)
    */
-  function renderStatusCardHTML(rodEvent, reading) {
-    const status = (rodEvent && rodEvent.status) || 'CLEAR';
-    const statusClass = statusToClass(status);
+  function renderStatusCardHTML(rodEvent, reading, dynamics) {
+    const status = (dynamics && dynamics.effectiveStatus) || (rodEvent && rodEvent.status) || 'CLEAR';
+    const mode = dynamics ? dynamics.mode : 'STEADY';
+    const currentWater = dynamics ? dynamics.currentWater : Number((reading && reading.water_cm) || 0);
+    const rainStart = dynamics ? dynamics.rainStart : 10;
 
     let titleText = 'Drain Clear ✅';
-    let descText = 'Water velocity is draining normally after precipitation.';
+    let descText = `Water depth is ${currentWater.toFixed(1)} cm with unobstructed culvert clearance.`;
     let tintStyle = 'background: rgba(34, 197, 94, 0.08); border-color: rgba(34, 197, 94, 0.3);';
 
     if (status === 'WATCH') {
       titleText = 'Watch: Drainage Slowing ⚠️';
-      descText = 'Rate of drop is below baseline. Debris may be accumulating.';
+      descText = 'Rate of drop or capacity margin is reduced. Debris may be accumulating.';
       tintStyle = 'background: rgba(245, 158, 11, 0.08); border-color: rgba(245, 158, 11, 0.3);';
     } else if (status === 'PRE_CLOG') {
       titleText = 'Maintenance Required: Partial Blockage 🚨';
@@ -1298,9 +1573,20 @@
       titleText = 'Baseline Calibrated ℹ️';
       descText = 'New reference drainage benchmark established.';
       tintStyle = 'background: rgba(59, 130, 246, 0.08); border-color: rgba(59, 130, 246, 0.3);';
+    } else if (mode === 'ACTIVE_DROP') {
+      titleText = 'Active Drainage in Progress 💧';
+      descText = `Water level receding at ${dynamics.measuredRodCmMin.toFixed(2)} cm/min (${dynamics.h1Cm.toFixed(1)} → ${dynamics.h2Cm.toFixed(1)} cm).`;
+    } else if (mode === 'RISING') {
+      titleText = currentWater >= rainStart ? 'Rain / Inflow Accumulation Detected 🌧️' : 'Water Level Rising ↑';
+      descText = `Inflow rate +${dynamics.liveSlopeCmMin.toFixed(2)} cm/min (current depth ${currentWater.toFixed(1)} cm).`;
+      tintStyle = 'background: rgba(245, 158, 11, 0.08); border-color: rgba(245, 158, 11, 0.3);';
+    } else if (currentWater > rainStart) {
+      titleText = 'Standing Water Above Rain Threshold ⚠️';
+      descText = `Water is steady at ${currentWater.toFixed(1)} cm above ${rainStart} cm threshold; monitoring for drop.`;
+      tintStyle = 'background: rgba(245, 158, 11, 0.08); border-color: rgba(245, 158, 11, 0.3);';
     }
 
-    if (reading && reading.flood_risk) {
+    if ((reading && reading.flood_risk) || (dynamics && dynamics.floodRisk)) {
       titleText = 'FLOOD WARNING: Water Near Surface 🌊';
       descText = 'Water depth has crossed 90% capacity threshold!';
       tintStyle = 'background: rgba(239, 68, 68, 0.15); border-color: #ef4444;';
@@ -1368,30 +1654,58 @@
    * Visualizes measured rate of drop vs calibration baseline:
    * 0-50% = Red (PRE_CLOG), 50-80% = Amber (WATCH), 80-100%+ = Green (CLEAR)
    */
-  function renderRodGaugeHTML(rodEvent) {
-    const ratio = rodEvent && rodEvent.ratio !== undefined ? Number(rodEvent.ratio) : 1.0;
-    const rodVal = rodEvent && rodEvent.rod_cm_min !== undefined ? Number(rodEvent.rod_cm_min).toFixed(2) : '--';
-    const baseline = rodEvent && rodEvent.baseline_rod !== undefined ? Number(rodEvent.baseline_rod).toFixed(2) : '--';
-    const percent = isNaN(ratio) ? 100 : Math.round(ratio * 100);
+  function renderRodGaugeHTML(rodEvent, dynamics) {
+    const dyn = dynamics || {};
+    const mode = dyn.mode || (rodEvent && rodEvent.rod_cm_min !== undefined ? 'HARDWARE_EVENT' : 'STEADY');
+    const ratio = dyn.gaugeRatio !== undefined
+      ? Number(dyn.gaugeRatio)
+      : (rodEvent && rodEvent.ratio !== undefined ? Number(rodEvent.ratio) : 1.0);
+    const percent = dyn.gaugePercent !== undefined ? dyn.gaugePercent : (isNaN(ratio) ? 100 : Math.round(ratio * 100));
 
-    // Angle: 0% maps to -90 degrees, 100% maps to +90 degrees (180 deg total sweep)
-    // Clamp needle display between -90 and +90
+    const rodVal = mode === 'RISING'
+      ? `+${Number(dyn.measuredRodCmMin || 0).toFixed(2)}`
+      : (dyn.measuredRodCmMin !== undefined
+        ? Number(dyn.measuredRodCmMin).toFixed(2)
+        : (rodEvent && rodEvent.rod_cm_min !== undefined ? Number(rodEvent.rod_cm_min).toFixed(2) : '0.00'));
+
+    const baseline = dyn.baselineRod !== undefined
+      ? Number(dyn.baselineRod).toFixed(2)
+      : (rodEvent && rodEvent.baseline_rod !== undefined ? Number(rodEvent.baseline_rod).toFixed(2) : '--');
+
+    const h1Display = dyn.h1Cm !== undefined
+      ? Number(dyn.h1Cm).toFixed(1) + ' cm'
+      : (rodEvent && rodEvent.h1_cm !== undefined ? Number(rodEvent.h1_cm).toFixed(1) + ' cm' : '--');
+    const h2Display = dyn.h2Cm !== undefined
+      ? Number(dyn.h2Cm).toFixed(1) + ' cm'
+      : (rodEvent && rodEvent.h2_cm !== undefined ? Number(rodEvent.h2_cm).toFixed(1) + ' cm' : '--');
+    const durDisplay = dyn.durationS !== undefined
+      ? formatDuration(dyn.durationS)
+      : formatDuration(rodEvent && rodEvent.duration_s);
+
+    const isCapacityMode = mode === 'STEADY' || mode === 'RISING';
     const clampedRatio = Math.min(1.2, Math.max(0, ratio));
-    const needleDeg = -90 + (clampedRatio / 1.0) * 150; // map 0..1 to -90..+60 (leaves room for >100%)
+    const needleDeg = -90 + (clampedRatio / 1.0) * 150;
+    const valColor = ratio >= 0.8 ? 'var(--color-clear)' : ratio >= 0.5 ? 'var(--color-watch)' : 'var(--color-preclog)';
+
+    const primaryLabel = mode === 'RISING'
+      ? `${percent}% Clearance`
+      : (mode === 'STEADY' ? `${percent}% Clear` : `${percent}%`);
+    const rateLine = mode === 'RISING'
+      ? `Inflow <strong>${rodVal}</strong> cm/min · Cap Reserve <strong>${percent}%</strong>`
+      : (mode === 'STEADY'
+        ? `Live Flow <strong>${rodVal}</strong> / Baseline <strong>${baseline}</strong> cm/min`
+        : `Measured <strong>${rodVal}</strong> / Baseline <strong>${baseline}</strong> cm/min`);
 
     return `
       <div class="gauge-container">
         <svg class="gauge-svg" viewBox="0 0 240 130">
           <!-- Zone 1: Red (PRE_CLOG: 0 to 50%) -->
-          <!-- Arc from 180deg to 126deg -->
           <path d="M 20 110 A 100 100 0 0 1 61.2 39.3" fill="none" stroke="#ef4444" stroke-width="18" stroke-linecap="round" />
           
           <!-- Zone 2: Amber (WATCH: 50% to 80%) -->
-          <!-- Arc from 126deg to 72deg -->
           <path d="M 61.2 39.3 A 100 100 0 0 1 150.9 22.1" fill="none" stroke="#f59e0b" stroke-width="18" />
 
           <!-- Zone 3: Green (CLEAR: 80% to 100%+) -->
-          <!-- Arc from 72deg to 0deg -->
           <path d="M 150.9 22.1 A 100 100 0 0 1 220 110" fill="none" stroke="#22c55e" stroke-width="18" stroke-linecap="round" />
 
           <!-- Pivot Center Circle -->
@@ -1405,26 +1719,26 @@
         </svg>
 
         <div class="gauge-summary">
-          <div class="gauge-ratio" style="color: ${ratio >= 0.8 ? 'var(--color-clear)' : ratio >= 0.5 ? 'var(--color-watch)' : 'var(--color-preclog)'};">
-            ${percent}%
+          <div class="gauge-ratio" style="color: ${valColor}; font-size: ${isCapacityMode ? '1.35rem' : '1.75rem'};">
+            ${primaryLabel}
           </div>
           <div class="gauge-rod-details">
-            Measured <strong>${rodVal}</strong> / Baseline <strong>${baseline}</strong> cm/min
+            ${rateLine}
           </div>
         </div>
 
         <table class="mini-stats-table">
           <tr>
-            <td>Start Depth (H1):</td>
-            <td>${rodEvent && rodEvent.h1_cm !== undefined ? Number(rodEvent.h1_cm).toFixed(1) + ' cm' : '--'}</td>
+            <td>${isCapacityMode ? 'Window Start Depth:' : 'Start Depth (H1):'}</td>
+            <td>${h1Display}</td>
           </tr>
           <tr>
-            <td>End Depth (H2):</td>
-            <td>${rodEvent && rodEvent.h2_cm !== undefined ? Number(rodEvent.h2_cm).toFixed(1) + ' cm' : '--'}</td>
+            <td>${isCapacityMode ? 'Current Depth:' : 'End Depth (H2):'}</td>
+            <td>${h2Display}</td>
           </tr>
           <tr>
-            <td>Drain Duration:</td>
-            <td>${formatDuration(rodEvent && rodEvent.duration_s)}</td>
+            <td>${isCapacityMode ? 'Window Span:' : 'Drain Duration:'}</td>
+            <td>${durDisplay}</td>
           </tr>
         </table>
       </div>
@@ -1434,15 +1748,22 @@
   /**
    * Component 5: Health Score Card HTML
    */
-  function renderHealthScoreHTML(score) {
-    let color = 'var(--color-clear)';
-    let label = 'Optimal Condition';
-    if (score < 50) {
-      color = 'var(--color-preclog)';
-      label = 'Severe Clog Risk';
-    } else if (score < 80) {
-      color = 'var(--color-watch)';
-      label = 'Maintenance Needed';
+  function renderHealthScoreHTML(health) {
+    const score = typeof health === 'object' && health !== null ? health.score : Number(health || 0);
+    let color = (typeof health === 'object' && health.color) || 'var(--color-clear)';
+    let label = (typeof health === 'object' && health.label) || 'Optimal Condition';
+    const summary = (typeof health === 'object' && health.summary) ||
+      'Score derived from live depth clearance margin, drainage velocity, and flood risk.';
+    const chips = (typeof health === 'object' && Array.isArray(health.chips)) ? health.chips : [];
+
+    if (!health || typeof health !== 'object') {
+      if (score < 50) {
+        color = 'var(--color-preclog)';
+        label = 'Severe Clog Risk';
+      } else if (score < 80) {
+        color = 'var(--color-watch)';
+        label = 'Maintenance Needed';
+      }
     }
 
     return `
@@ -1452,10 +1773,15 @@
           <span class="health-score-label">Health</span>
         </div>
         <div style="flex: 1;">
-          <h4 style="font-size: 1rem; margin-bottom: 0.25rem;">${label}</h4>
+          <h4 style="font-size: 1rem; margin-bottom: 0.25rem; color: ${color};">${escapeHTML(label)}</h4>
           <p style="font-size: 0.8rem; color: var(--text-secondary); line-height: 1.4;">
-            Score derived from baseline drop velocity ratio, flood margin clearance, and historical repeatability.
+            ${escapeHTML(summary)}
           </p>
+          ${chips.length > 0 ? `
+            <div style="display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.45rem;">
+              ${chips.map(c => `<span class="badge calibrated" style="font-size: 0.68rem;">${escapeHTML(c)}</span>`).join('')}
+            </div>
+          ` : ''}
         </div>
       </div>
     `;
@@ -2266,11 +2592,14 @@
 
   // ─── 8. TAB: TRENDS ────────────────────────────────────────────────────────
 
-  async function renderTrendsTab() {
+  async function renderTrendsTab(silent = false) {
     const container = document.getElementById('tab-trends');
     if (!container) return;
 
-    showSkeleton('tab-trends', 'Analyzing long-term rate of drop degradation trends...');
+    const alreadyHasTrendsDOM = Boolean(document.getElementById('chart-trends-water') && document.getElementById('chart-trends-ratio'));
+    if (!silent || !alreadyHasTrendsDOM) {
+      showSkeleton('tab-trends', 'Analyzing long-term rate of drop degradation trends...');
+    }
 
     try {
       const rangeCfg = getTrendRangeConfig(state.trendsRange);
@@ -2290,7 +2619,7 @@
 
       const trend = trendData || {};
       const config = (configData && configData.config) || {};
-      const points = trend.events || trend.points || [];
+      const fromMs = new Date(fromDate).getTime();
 
       const fetchedSeries = Array.isArray(readingsRes) ? readingsRes : (readingsRes.data || readingsRes.readings || []);
       const normalizedFetched = fetchedSeries
@@ -2304,7 +2633,7 @@
 
       const backendSeries = Array.isArray(trend.water_series)
         ? trend.water_series
-          .filter(p => new Date(p.time || p.created_at).getTime() >= new Date(fromDate).getTime())
+          .filter(p => new Date(p.time || p.created_at).getTime() >= fromMs)
           .map(p => ({
             ...p,
             time: p.time || p.created_at,
@@ -2315,35 +2644,65 @@
 
       const waterSeries = normalizedFetched.length >= 2 ? normalizedFetched : (backendSeries.length > 0 ? backendSeries : normalizedFetched);
 
-      const readingCount = trend.reading_count !== undefined ? trend.reading_count : waterSeries.length;
+      // Filter RoD events strictly into the selected time window
+      const allTrendPoints = trend.events || trend.points || [];
+      const points = allTrendPoints.filter(p => !p.created_at || new Date(p.created_at).getTime() >= fromMs);
+
+      // Compute instantaneous dH/dt velocity (cm/min) across waterSeries
+      const velocitySeries = [];
+      for (let i = 1; i < waterSeries.length; i++) {
+        const prev = waterSeries[i - 1];
+        const curr = waterSeries[i];
+        const dtMin = (new Date(curr.time) - new Date(prev.time)) / 60000;
+        if (dtMin > 0.02) {
+          const rawRate = (curr.water_cm - prev.water_cm) / dtMin;
+          velocitySeries.push({
+            time: curr.time,
+            rate: Number(Math.max(-50, Math.min(50, rawRate)).toFixed(3))
+          });
+        }
+      }
+
+      const readingCount = waterSeries.length;
       const avgWater = waterSeries.length > 0
         ? waterSeries.reduce((s, p) => s + (Number(p.water_cm) || 0), 0) / waterSeries.length
         : (trend.avg_water_cm || 0);
       const peakWater = waterSeries.length > 0
         ? Math.max(...waterSeries.map(p => Number(p.water_cm_max !== undefined ? p.water_cm_max : p.water_cm) || 0))
         : (trend.peak_water_cm || 0);
+      const latestWater = waterSeries.length > 0 ? waterSeries[waterSeries.length - 1].water_cm : 0;
+      const latestRate = velocitySeries.length > 0 ? velocitySeries[velocitySeries.length - 1].rate : 0;
+      const netShift = waterSeries.length >= 2 ? (waterSeries[waterSeries.length - 1].water_cm - waterSeries[0].water_cm) : 0;
 
       let insightText = typeof trend.insight === 'string'
         ? trend.insight
         : (trend.insight && trend.insight.text ? trend.insight.text : '');
-      if (!insightText || insightText === 'Not enough data') {
-        if (waterSeries.length > 0) {
-          insightText = `Analyzed ${waterSeries.length} telemetry points in the ${state.trendsRange} window: average water depth ${avgWater.toFixed(1)} cm (peak ${peakWater.toFixed(1)} cm). Predictive RoD degradation regression will activate as drain drop cycles accumulate.`;
+      if (points.length < 2) {
+        if (waterSeries.length >= 2) {
+          const directionStr = latestRate >= 0.25
+            ? `actively rising (+${latestRate.toFixed(2)} cm/min)`
+            : (latestRate <= -0.25
+              ? `actively draining (${latestRate.toFixed(2)} cm/min)`
+              : 'currently steady');
+          insightText = `Analyzed ${waterSeries.length} points in the ${state.trendsRange} window: depth is ${latestWater.toFixed(1)} cm (${directionStr}; mean ${avgWater.toFixed(1)} cm, peak ${peakWater.toFixed(1)} cm, net shift ${netShift >= 0 ? '+' : ''}${netShift.toFixed(1)} cm). Linear RoD degradation regression unlocks after 2+ full drain drop cycles.`;
         } else {
-          insightText = 'Awaiting telemetry packets in this time window. Try widening the range to 7d or 30d.';
+          insightText = `Awaiting more telemetry packets in the ${state.trendsRange} window. Try switching to 24h or 7d if no readings arrived in the last hour.`;
         }
       }
 
-      const isDeclining = (trend.slope_per_week !== null && trend.slope_per_week !== undefined && trend.slope_per_week < 0) || (trend.insight && trend.insight.status === 'declining');
+      const isDeclining = (trend.slope_per_week !== null && trend.slope_per_week !== undefined && trend.slope_per_week < 0) || (trend.insight && trend.insight.status === 'declining') || (latestRate >= 0.5 && latestWater >= (Number(config.rain_start_cm) || 10));
       const projectedDays = trend.projected_days_until_preclog || (trend.insight && trend.insight.projected_days);
-      const hasRatioPoints = points && points.length > 0;
+      const hasRegressionPoints = points && points.length >= 2;
 
       container.innerHTML = `
         <!-- Time Range Selector -->
         <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.25rem;">
           <div>
-            <h2 style="font-size: 1.3rem; font-weight: 800;">Degradation &amp; Velocity Trends</h2>
-            <p style="font-size: 0.85rem; color: var(--text-secondary);">Predictive linear regression, hydrology envelope &amp; clogging projection models</p>
+            <div style="display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;">
+              <h2 style="font-size: 1.3rem; font-weight: 800;">Degradation &amp; Velocity Trends</h2>
+              <span class="badge badge-info" style="font-size: 0.72rem;">📡 Live 10s Sync (${escapeHTML(state.trendsRange)})</span>
+            </div>
+            <p style="font-size: 0.85rem; color: var(--text-secondary);">Predictive linear regression, live dH/dt flow velocity &amp; clogging projection models</p>
           </div>
 
           <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
@@ -2363,11 +2722,13 @@
               <h4 style="font-size: 1rem; margin-bottom: 0.25rem;">Predictive Maintenance Diagnostic</h4>
               <p style="font-size: 0.85rem; color: var(--text-secondary); line-height: 1.45;">${escapeHTML(insightText)}</p>
               <div style="display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.65rem;">
-                <span class="badge badge-info">📡 ${waterSeries.length} Window Points (${readingCount} total)</span>
+                <span class="badge badge-info">📡 ${readingCount} Points (${escapeHTML(state.trendsRange)})</span>
+                <span class="badge clear">Latest: ${latestWater.toFixed(1)} cm</span>
                 <span class="badge clear">Mean: ${avgWater.toFixed(1)} cm</span>
                 <span class="badge ${peakWater >= (Number(config.rain_start_cm) || 10) ? 'watch' : 'clear'}">Peak: ${peakWater.toFixed(1)} cm</span>
-                ${trend.slope_per_week !== null && trend.slope_per_week !== undefined ? `<span class="badge ${trend.slope_per_week < 0 ? 'watch' : 'clear'}">Slope: ${trend.slope_per_week > 0 ? '+' : ''}${Number(trend.slope_per_week).toFixed(3)}/wk</span>` : ''}
-                ${trend.r_squared !== null && trend.r_squared !== undefined ? `<span class="badge calibrated">R²: ${Number(trend.r_squared).toFixed(2)}</span>` : ''}
+                <span class="badge ${latestRate > 0.25 ? 'watch' : (latestRate < -0.25 ? 'clear' : 'calibrated')}">Flow dH/dt: ${latestRate >= 0 ? '+' : ''}${latestRate.toFixed(2)} cm/min</span>
+                ${hasRegressionPoints && trend.slope_per_week !== null && trend.slope_per_week !== undefined ? `<span class="badge ${trend.slope_per_week < 0 ? 'watch' : 'clear'}">Slope: ${trend.slope_per_week > 0 ? '+' : ''}${Number(trend.slope_per_week).toFixed(3)}/wk</span>` : ''}
+                ${hasRegressionPoints && trend.r_squared !== null && trend.r_squared !== undefined ? `<span class="badge calibrated">R²: ${Number(trend.r_squared).toFixed(2)}</span>` : ''}
               </div>
               ${projectedDays ? `
                 <div style="margin-top: 0.5rem; font-size: 0.8rem; font-weight: 700; color: var(--color-watch);">
@@ -2389,11 +2750,11 @@
           </div>
         </div>
 
-        <!-- RoD Ratio Trend OR Telemetry Moving Baseline Stability Chart -->
+        <!-- RoD Ratio Regression OR Live dH/dt Flow Velocity Chart -->
         <div class="card">
           <div class="card-header">
-            <h3 class="card-title"><span>📉</span> ${hasRatioPoints ? 'Rate of Drop Ratio Trend & Slope' : 'Water Depth Moving Baseline & Stability'}</h3>
-            <span class="card-subtitle">${hasRatioPoints ? 'Hollow points designate low-confidence readings' : 'Instantaneous depth vs rolling 5-point baseline & flood threshold'}</span>
+            <h3 class="card-title"><span>📉</span> ${hasRegressionPoints ? 'Rate of Drop Ratio Trend &amp; Slope' : 'Live Inflow &amp; Drainage Velocity (dH/dt)'}</h3>
+            <span class="card-subtitle">${hasRegressionPoints ? 'Hollow points designate low-confidence readings' : '+Rising (Inflow) vs -Falling (Draining RoD) in cm/min'}</span>
           </div>
           <div class="chart-container">
             <canvas id="chart-trends-ratio"></canvas>
@@ -2405,17 +2766,19 @@
       document.querySelectorAll('.trends-range-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
           state.trendsRange = e.target.getAttribute('data-range') || '24h';
-          renderTrendsTab();
+          renderTrendsTab(false);
         });
       });
 
       // Initialize trend charts
       initTrendsWaterChart(waterSeries, config);
-      initTrendsRatioChart(points, trend, waterSeries, config);
+      initTrendsRatioChart(points, trend, waterSeries, config, velocitySeries);
 
     } catch (err) {
       console.error('[Trends] Render failed:', err);
-      showError('tab-trends', `Trends computation failed: ${err.message}`, renderTrendsTab);
+      if (!silent) {
+        showError('tab-trends', `Trends computation failed: ${err.message}`, () => renderTrendsTab(false));
+      }
     }
   }
 
@@ -2499,16 +2862,16 @@
   }
 
   /**
-   * RoD Ratio Trend with Regression Line (falls back to Rolling Baseline Depth Stability when no RoD events exist)
+   * RoD Ratio Trend with Regression Line (falls back to live dH/dt flow velocity when <2 RoD events exist)
    */
-  function initTrendsRatioChart(points, regression, waterSeries, config) {
+  function initTrendsRatioChart(points, regression, waterSeries, config, velocitySeries) {
     const canvas = document.getElementById('chart-trends-ratio');
     if (!canvas) return;
     destroyChart('trendsRatio');
 
     const ctx = canvas.getContext('2d');
 
-    if (points && points.length > 0) {
+    if (points && points.length >= 2) {
       const labels = points.map(p => formatShortIST(p.created_at));
       const ratios = points.map(p => Number(p.ratio) || 0);
 
@@ -2524,22 +2887,17 @@
         return p.low_confidence ? 'transparent' : pointBorderColors[idx];
       });
 
-      let regressionData = [];
-      if (points.length >= 2) {
-        const n = points.length;
-        let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
-        for (let i = 0; i < n; i++) {
-          const x = i;
-          const y = Number(points[i].ratio) || 0;
-          sumX += x; sumY += y; sumXY += x * y; sumX2 += x * x;
-        }
-        const denom = n * sumX2 - sumX * sumX;
-        const slope = denom !== 0 ? (n * sumXY - sumX * sumY) / denom : 0;
-        const intercept = (sumY - slope * sumX) / n;
-        regressionData = points.map((_, idx) => Math.max(0, slope * idx + intercept));
-      } else {
-        regressionData = ratios.slice();
+      const n = points.length;
+      let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+      for (let i = 0; i < n; i++) {
+        const x = i;
+        const y = Number(points[i].ratio) || 0;
+        sumX += x; sumY += y; sumXY += x * y; sumX2 += x * x;
       }
+      const denom = n * sumX2 - sumX * sumX;
+      const slope = denom !== 0 ? (n * sumXY - sumX * sumY) / denom : 0;
+      const intercept = (sumY - slope * sumX) / n;
+      const regressionData = points.map((_, idx) => Math.max(0, slope * idx + intercept));
 
       chartRegistry['trendsRatio'] = new Chart(ctx, {
         type: 'line',
@@ -2588,46 +2946,51 @@
       return;
     }
 
-    // Fallback when 0 RoD cycles exist yet: plot rolling 5-point moving baseline vs flood limit
-    const series = waterSeries || [];
-    const labels = series.map(p => formatShortIST(p.time || p.created_at));
-    const rawValues = series.map(p => Number(p.water_cm_avg !== undefined ? p.water_cm_avg : p.water_cm) || 0);
-    const movingAvg = rawValues.map((_, idx) => {
-      const start = Math.max(0, idx - 4);
-      const slice = rawValues.slice(start, idx + 1);
-      return Number((slice.reduce((s, v) => s + v, 0) / slice.length).toFixed(2));
+    // Fallback when <2 RoD cycles exist in window: plot instantaneous dH/dt flow velocity (cm/min)
+    let velPoints = Array.isArray(velocitySeries) && velocitySeries.length > 0 ? velocitySeries : [];
+    if (velPoints.length === 0 && Array.isArray(waterSeries) && waterSeries.length >= 2) {
+      for (let i = 1; i < waterSeries.length; i++) {
+        const prev = waterSeries[i - 1];
+        const curr = waterSeries[i];
+        const dtMin = (new Date(curr.time || curr.created_at) - new Date(prev.time || prev.created_at)) / 60000;
+        if (dtMin > 0.02) {
+          const w1 = Number(prev.water_cm_avg !== undefined ? prev.water_cm_avg : prev.water_cm) || 0;
+          const w2 = Number(curr.water_cm_avg !== undefined ? curr.water_cm_avg : curr.water_cm) || 0;
+          velPoints.push({
+            time: curr.time || curr.created_at,
+            rate: Number(Math.max(-50, Math.min(50, (w2 - w1) / dtMin)).toFixed(3))
+          });
+        }
+      }
+    }
+
+    const labels = velPoints.map(v => formatShortIST(v.time || v.created_at));
+    const rawRates = velPoints.map(v => Number(v.rate) || 0);
+    const smoothRates = rawRates.map((_, idx) => {
+      const start = Math.max(0, idx - 2);
+      const slice = rawRates.slice(start, idx + 1);
+      return Number((slice.reduce((s, x) => s + x, 0) / slice.length).toFixed(3));
     });
-    const floodAlertCm = Number((config && config.flood_alert_cm) || 80);
+    const barColors = rawRates.map(r => (r > 0.15 ? 'rgba(245, 158, 11, 0.72)' : (r < -0.15 ? 'rgba(34, 197, 94, 0.72)' : 'rgba(148, 163, 184, 0.45)')));
 
     chartRegistry['trendsRatio'] = new Chart(ctx, {
-      type: 'line',
+      type: 'bar',
       data: {
-        labels: labels.length > 0 ? labels : ['No Telemetry'],
+        labels: labels.length > 0 ? labels : ['Awaiting Telemetry'],
         datasets: [
           {
-            label: '5-Point Moving Average Depth (cm)',
-            data: movingAvg.length > 0 ? movingAvg : [0],
+            label: 'Instantaneous dH/dt (cm/min)',
+            data: rawRates.length > 0 ? rawRates : [0],
+            backgroundColor: barColors,
+            borderRadius: 4
+          },
+          {
+            label: '3-Pt Smoothed Flow Trend',
+            data: smoothRates.length > 0 ? smoothRates : [0],
+            type: 'line',
             borderColor: '#ffd60a',
-            backgroundColor: 'rgba(255, 214, 10, 0.10)',
             borderWidth: 2.2,
             tension: 0.35,
-            fill: true,
-            pointRadius: 0
-          },
-          {
-            label: 'Observed Depth (cm)',
-            data: rawValues.length > 0 ? rawValues : [0],
-            borderColor: '#94a3b8',
-            borderWidth: 1,
-            pointRadius: rawValues.length > 60 ? 0 : 2,
-            fill: false
-          },
-          {
-            label: `Flood Alert Threshold (${floodAlertCm} cm)`,
-            data: (labels.length > 0 ? labels : ['No Telemetry']).map(() => floodAlertCm),
-            borderColor: '#ef4444',
-            borderDash: [5, 4],
-            borderWidth: 1.5,
             pointRadius: 0,
             fill: false
           }
@@ -2636,8 +2999,11 @@
       options: {
         responsive: true,
         maintainAspectRatio: false,
+        plugins: {
+          legend: { position: 'top', labels: { boxWidth: 12, font: { size: 10 } } }
+        },
         scales: {
-          y: { beginAtZero: true, title: { display: true, text: 'Water Depth Baseline (cm)' } },
+          y: { title: { display: true, text: 'Depth Change Rate (+Rise / -Drain cm/min)' } },
           x: { title: { display: true, text: 'Observation Window (IST)' } }
         }
       }
