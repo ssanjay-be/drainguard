@@ -58,6 +58,13 @@
   let leafletMarkerInstance = null;
   let renderedOverviewDeviceId = null;
 
+  // In-memory stale-while-revalidate cache so revisiting tabs renders in 0ms
+  const tabCache = {
+    analytics: {},
+    trends: {},
+    alerts: {}
+  };
+
   // ─── 2. Shared Formatting & UI Utilities ───────────────────────────────────
 
   /**
@@ -232,12 +239,30 @@
   }
 
   /**
-   * Renders a skeleton shimmer placeholder in target container
+   * Renders an engaging ultrasonic sonar & hydraulic waveform loader with shimmer skeleton tiles
    */
-  function showSkeleton(elementId, text = 'Loading data...') {
+  function showSkeleton(elementId, text = 'Syncing live telemetry...') {
     const el = document.getElementById(elementId);
     if (el) {
-      el.innerHTML = `<div class="skeleton-loader">${escapeHTML(text)}</div>`;
+      el.innerHTML = `
+        <div class="skeleton-loader" role="status" aria-live="polite">
+          <div class="dg-sonar-orb" aria-hidden="true">
+            <span class="dg-sonar-ring"></span>
+            <span class="dg-sonar-ring ring-2"></span>
+            <span class="dg-sonar-ring ring-3"></span>
+            <span class="dg-sonar-core">⚡</span>
+          </div>
+          <div class="dg-loader-wave" aria-hidden="true">
+            <span></span><span></span><span></span><span></span><span></span>
+          </div>
+          <div class="dg-loader-caption">${escapeHTML(text)}</div>
+          <div class="dg-loader-subcards" aria-hidden="true">
+            <div class="dg-shimmer-tile"></div>
+            <div class="dg-shimmer-tile"></div>
+            <div class="dg-shimmer-tile"></div>
+          </div>
+        </div>
+      `;
     }
   }
 
@@ -1961,204 +1986,506 @@
 
   // ─── 7. TAB: ANALYTICS ─────────────────────────────────────────────────────
 
-  async function renderAnalyticsTab() {
+  async function renderAnalyticsTab(forceFresh = false) {
     const container = document.getElementById('tab-analytics');
     if (!container) return;
 
-    showSkeleton('tab-analytics', 'Computing hydraulic analytics & telemetry aggregations...');
+    const deviceId = state.currentDeviceId;
+    const days = state.analyticsDays;
+    const cacheKey = `${deviceId}_${days}`;
+    const cached = tabCache.analytics[cacheKey];
+
+    if (cached && !forceFresh) {
+      paintAnalyticsTab(container, cached.payload, days);
+      // Silently refresh if older than 8s and user is still on Analytics
+      if (Date.now() - cached.ts > 8000) {
+        fetchAnalyticsPayload(deviceId, days)
+          .then(fresh => {
+            tabCache.analytics[cacheKey] = { payload: fresh, ts: Date.now() };
+            if (state.activeTab === 'analytics' && state.currentDeviceId === deviceId && state.analyticsDays === days) {
+              paintAnalyticsTab(container, fresh, days);
+            }
+          })
+          .catch(() => {});
+      }
+      return;
+    }
+
+    showSkeleton('tab-analytics', 'Synchronizing hydraulic analytics & drop metrics...');
 
     try {
-      const periodStart = new Date(Date.now() - state.analyticsDays * 24 * 60 * 60 * 1000).toISOString();
-      const [summary, rodEvents, readingsRes] = await Promise.all([
-        API.getAnalyticsSummary(state.currentDeviceId, state.analyticsDays),
-        API.getRodEvents({ device_id: state.currentDeviceId, from: periodStart, pageSize: 100, limit: 100 }).catch(() => ({ data: [] })),
-        API.getReadings({ device_id: state.currentDeviceId, from: periodStart, pageSize: 300, limit: 300 }).catch(() => ({ data: [] }))
-      ]);
-
-      const eventsList = Array.isArray(rodEvents) ? rodEvents : (rodEvents.data || rodEvents.events || []);
-      const eventsSummary = summary || {};
-      const derivedEvents = Array.isArray(eventsSummary.derived_events) ? eventsSummary.derived_events : [];
-      const effectiveEvents = eventsList.length > 0 ? eventsList : derivedEvents;
-
-      const rawList = Array.isArray(readingsRes) ? readingsRes : (readingsRes.data || readingsRes.readings || []);
-      const rawReadings = [...rawList].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-
-      const hasEvents = effectiveEvents.length > 0;
-      const totalReadings = eventsSummary.total_readings !== undefined ? eventsSummary.total_readings : rawReadings.length;
-      const avgWater = eventsSummary.avg_water_cm !== null && eventsSummary.avg_water_cm !== undefined
-        ? Number(eventsSummary.avg_water_cm)
-        : (rawReadings.length > 0 ? rawReadings.reduce((s, r) => s + (Number(r.water_cm) || 0), 0) / rawReadings.length : 0);
-      const peakWater = eventsSummary.peak_water_cm !== null && eventsSummary.peak_water_cm !== undefined
-        ? Number(eventsSummary.peak_water_cm)
-        : (rawReadings.length > 0 ? Math.max(...rawReadings.map(r => Number(r.water_cm) || 0)) : 0);
-      const floodRiskCount = eventsSummary.flood_risk_count !== undefined
-        ? Number(eventsSummary.flood_risk_count)
-        : rawReadings.filter(r => r.flood_risk).length;
-
-      const statusCounts = eventsSummary.status_counts || {};
-      const clearCount = statusCounts.CLEAR !== undefined
-        ? statusCounts.CLEAR
-        : effectiveEvents.filter(e => String(e.status).toUpperCase() === 'CLEAR').length;
-      const alertEventCount = (statusCounts.WATCH || 0) + (statusCounts.PRE_CLOG || 0) ||
-        effectiveEvents.filter(e => ['WATCH', 'PRE_CLOG'].includes(String(e.status).toUpperCase())).length;
-      const avgRodVal = eventsSummary.avg_rod !== null && eventsSummary.avg_rod !== undefined
-        ? Number(eventsSummary.avg_rod).toFixed(2)
-        : calculateAvgRod(effectiveEvents);
-
-      const sourceBadgeText = eventsList.length > 0
-        ? `${eventsList.length} Hardware Events + ${totalReadings} Readings`
-        : (derivedEvents.length > 0
-          ? `${derivedEvents.length} Derived Drain Cycles + ${totalReadings} Readings`
-          : `${totalReadings} Sensor Readings Active`);
-
-      const chartATitle = hasEvents ? '(a) Rate of Drop per Drain Cycle' : '(a) Water Depth Profile Over Time';
-      const chartASubtitle = hasEvents
-        ? (eventsList.length > 0 ? 'Coloured by Diagnostic Status' : 'Derived from Sensor Drop Sequences')
-        : 'Bucketed Mean & Peak Water Depth (cm)';
-
-      const chartBTitle = hasEvents ? '(b) Status Breakdown' : '(b) Telemetry State Breakdown';
-      const chartBSubtitle = hasEvents ? 'Event Ratio Distribution' : 'Sensor FSM State Distribution';
-
-      const chartDTitle = hasEvents ? '(d) Initial Depth (H1) vs RoD Correlation' : '(d) Water Depth vs Sensor Distance';
-      const chartDSubtitle = hasEvents ? 'Hydraulic Head Pressure Effect' : 'Live Ultrasonic Calibration Scatter';
-
-      const chartETitle = hasEvents ? '(e) Rain Events Timeline' : '(e) Telemetry Volume Timeline';
-      const chartESubtitle = hasEvents ? 'Storm Cycle Frequency' : 'Captured Sensor Readings per Day';
-
-      container.innerHTML = `
-        <!-- Header with Date Range Chips & Print Action -->
-        <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.25rem;">
-          <div>
-            <div style="display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;">
-              <h2 style="font-size: 1.3rem; font-weight: 800;">Hydraulic Diagnostic Analytics</h2>
-              <span class="badge badge-info" style="font-size: 0.72rem;">📡 ${escapeHTML(sourceBadgeText)}</span>
-            </div>
-            <p style="font-size: 0.85rem; color: var(--text-secondary);">Long-term rate of drop metrics, telemetry hydrology &amp; clog detection patterns</p>
-          </div>
-          
-          <div style="display: flex; align-items: center; gap: 0.5rem;" class="no-print">
-            <!-- Range Chips -->
-            <button class="btn ${state.analyticsDays === 7 ? 'btn-primary' : 'btn-secondary'} btn-sm analytics-chip" data-days="7">7 Days</button>
-            <button class="btn ${state.analyticsDays === 30 ? 'btn-primary' : 'btn-secondary'} btn-sm analytics-chip" data-days="30">30 Days</button>
-            <button class="btn ${state.analyticsDays === 90 ? 'btn-primary' : 'btn-secondary'} btn-sm analytics-chip" data-days="90">90 Days</button>
-            
-            <!-- Print Report Button -->
-            <button id="btn-print-analytics" class="btn btn-secondary btn-sm" title="Print report for GCC Municipal Engineers">
-              <span>🖨️</span> Print Report
-            </button>
-          </div>
-        </div>
-
-        <!-- KPI Cards Grid -->
-        <div class="kpi-grid">
-          <div class="kpi-card">
-            <span class="kpi-title">${hasEvents ? 'Total Drain Events' : 'Telemetry Samples'}</span>
-            <span class="kpi-value">${hasEvents ? (eventsSummary.total_rain_events || effectiveEvents.length) : totalReadings}</span>
-            <span class="kpi-subtext">${hasEvents ? (eventsList.length > 0 ? `Hardware cycles (${totalReadings} pts)` : `Derived from ${totalReadings} readings`) : `Captured packets (${state.analyticsDays}d)`}</span>
-          </div>
-          <div class="kpi-card">
-            <span class="kpi-title">${hasEvents ? 'Clear Drainage Rate' : 'Peak Water Depth'}</span>
-            <span class="kpi-value" style="color: ${hasEvents ? 'var(--color-clear)' : 'var(--accent-primary)'};">
-              ${hasEvents
-                ? Math.round((clearCount / Math.max(1, eventsSummary.total_rain_events || effectiveEvents.length)) * 100) + '%'
-                : `${peakWater.toFixed(1)} <span style="font-size: 0.9rem;">cm</span>`}
-            </span>
-            <span class="kpi-subtext">${hasEvents ? `Peak depth ${peakWater.toFixed(1)} cm` : `Max recorded depth (${state.analyticsDays}d)`}</span>
-          </div>
-          <div class="kpi-card">
-            <span class="kpi-title">${hasEvents ? 'Average Rate of Drop' : 'Mean Water Depth'}</span>
-            <span class="kpi-value">
-              ${hasEvents
-                ? `${avgRodVal} <span style="font-size: 0.9rem;">cm/min</span>`
-                : `${avgWater.toFixed(1)} <span style="font-size: 0.9rem;">cm</span>`}
-            </span>
-            <span class="kpi-subtext">${hasEvents ? `Mean depth ${avgWater.toFixed(1)} cm` : `Baseline sensor level (${state.analyticsDays}d)`}</span>
-          </div>
-          <div class="kpi-card">
-            <span class="kpi-title">Alerts &amp; Flood Flags</span>
-            <span class="kpi-value" style="color: ${(alertEventCount + floodRiskCount) > 0 ? 'var(--color-preclog)' : 'var(--color-clear)'};">${hasEvents ? alertEventCount : floodRiskCount}</span>
-            <span class="kpi-subtext">${hasEvents ? `Watch/pre-clog + ${floodRiskCount} flood flags` : 'High-water flood risk readings'}</span>
-          </div>
-        </div>
-
-        <!-- Month over Month Comparison Card -->
-        <div class="card" style="margin-bottom: 1.25rem;">
-          <div class="card-header">
-            <h3 class="card-title"><span>📅</span> ${hasEvents ? 'Period-Over-Period Drainage Velocity Trend' : 'Period-Over-Period Water Depth Comparison'}</h3>
-          </div>
-          ${renderMoMComparisonHTML(eventsSummary, effectiveEvents, rawReadings)}
-        </div>
-
-        <!-- Analytics Charts Grid: (a) RoD / Water Depth Bar Chart & (b) Doughnut Distribution -->
-        <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 1.25rem; margin-bottom: 1.25rem;">
-          <div class="card">
-            <div class="card-header">
-              <h3 class="card-title"><span>📊</span> ${chartATitle}</h3>
-              <span class="card-subtitle">${chartASubtitle}</span>
-            </div>
-            <div class="chart-container">
-              <canvas id="chart-analytics-rod"></canvas>
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-header">
-              <h3 class="card-title"><span>🍩</span> ${chartBTitle}</h3>
-              <span class="card-subtitle">${chartBSubtitle}</span>
-            </div>
-            <div class="chart-container">
-              <canvas id="chart-analytics-doughnut"></canvas>
-            </div>
-          </div>
-        </div>
-
-        <!-- Additional Charts Grid: (d) Scatter Plot & (e) Timeline Grouping -->
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem;">
-          <div class="card">
-            <div class="card-header">
-              <h3 class="card-title"><span>🎯</span> ${chartDTitle}</h3>
-              <span class="card-subtitle">${chartDSubtitle}</span>
-            </div>
-            <div class="chart-container">
-              <canvas id="chart-analytics-scatter"></canvas>
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-header">
-              <h3 class="card-title"><span>🌧️</span> ${chartETitle}</h3>
-              <span class="card-subtitle">${chartESubtitle}</span>
-            </div>
-            <div class="chart-container">
-              <canvas id="chart-analytics-weekly"></canvas>
-            </div>
-          </div>
-        </div>
-      `;
-
-      // Attach Range Chip clicks
-      document.querySelectorAll('.analytics-chip').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-          state.analyticsDays = Number(e.target.getAttribute('data-days')) || 30;
-          renderAnalyticsTab();
-        });
-      });
-
-      // Attach Print handler
-      const printBtn = document.getElementById('btn-print-analytics');
-      if (printBtn) {
-        printBtn.addEventListener('click', () => window.print());
-      }
-
-      // Initialize all 4 charts (with full readings fallback + live event support)
-      initAnalyticsRodChart(effectiveEvents, rawReadings);
-      initAnalyticsDoughnutChart(effectiveEvents, eventsSummary, rawReadings);
-      initAnalyticsScatterChart(effectiveEvents, rawReadings);
-      initAnalyticsWeeklyChart(effectiveEvents, rawReadings);
-
+      const payload = await fetchAnalyticsPayload(deviceId, days);
+      tabCache.analytics[cacheKey] = { payload, ts: Date.now() };
+      if (state.activeTab !== 'analytics' || state.currentDeviceId !== deviceId || state.analyticsDays !== days) return;
+      paintAnalyticsTab(container, payload, days);
     } catch (err) {
       console.error('[Analytics] Render failed:', err);
-      showError('tab-analytics', `Failed to generate analytics: ${err.message}`, renderAnalyticsTab);
+      showError('tab-analytics', `Failed to generate analytics: ${err.message}`, () => renderAnalyticsTab(true));
+    }
+  }
+
+  async function fetchAnalyticsPayload(deviceId, days) {
+    const periodStart = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const [summary, rodEvents, readingsRes] = await Promise.all([
+      API.getAnalyticsSummary(deviceId, days),
+      API.getRodEvents({ device_id: deviceId, from: periodStart, pageSize: 100, limit: 100 }).catch(() => ({ data: [] })),
+      API.getReadings({ device_id: deviceId, from: periodStart, pageSize: 300, limit: 300 }).catch(() => ({ data: [] }))
+    ]);
+    return { summary, rodEvents, readingsRes };
+  }
+
+  function paintAnalyticsTab(container, payload, days) {
+    const { summary, rodEvents, readingsRes } = payload;
+    const eventsList = Array.isArray(rodEvents) ? rodEvents : (rodEvents.data || rodEvents.events || []);
+    const eventsSummary = summary || {};
+    const derivedEvents = Array.isArray(eventsSummary.derived_events) ? eventsSummary.derived_events : [];
+    const effectiveEvents = eventsList.length > 0 ? eventsList : derivedEvents;
+
+    const rawList = Array.isArray(readingsRes) ? readingsRes : (readingsRes.data || readingsRes.readings || []);
+    const rawReadings = [...rawList].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+    const hasEvents = effectiveEvents.length > 0;
+    const totalReadings = eventsSummary.total_readings !== undefined ? eventsSummary.total_readings : rawReadings.length;
+    const avgWater = eventsSummary.avg_water_cm !== null && eventsSummary.avg_water_cm !== undefined
+      ? Number(eventsSummary.avg_water_cm)
+      : (rawReadings.length > 0 ? rawReadings.reduce((s, r) => s + (Number(r.water_cm) || 0), 0) / rawReadings.length : 0);
+    const peakWater = eventsSummary.peak_water_cm !== null && eventsSummary.peak_water_cm !== undefined
+      ? Number(eventsSummary.peak_water_cm)
+      : (rawReadings.length > 0 ? Math.max(...rawReadings.map(r => Number(r.water_cm) || 0)) : 0);
+    const floodRiskCount = eventsSummary.flood_risk_count !== undefined
+      ? Number(eventsSummary.flood_risk_count)
+      : rawReadings.filter(r => r.flood_risk).length;
+
+    const statusCounts = eventsSummary.status_counts || {};
+    const clearCount = statusCounts.CLEAR !== undefined
+      ? statusCounts.CLEAR
+      : effectiveEvents.filter(e => String(e.status).toUpperCase() === 'CLEAR').length;
+    const alertEventCount = (statusCounts.WATCH || 0) + (statusCounts.PRE_CLOG || 0) ||
+      effectiveEvents.filter(e => ['WATCH', 'PRE_CLOG'].includes(String(e.status).toUpperCase())).length;
+    const avgRodVal = eventsSummary.avg_rod !== null && eventsSummary.avg_rod !== undefined
+      ? Number(eventsSummary.avg_rod).toFixed(2)
+      : calculateAvgRod(effectiveEvents);
+
+    const sourceBadgeText = eventsList.length > 0
+      ? `${eventsList.length} Hardware Events + ${totalReadings} Readings`
+      : (derivedEvents.length > 0
+        ? `${derivedEvents.length} Derived Drain Cycles + ${totalReadings} Readings`
+        : `${totalReadings} Sensor Readings Active`);
+
+    const chartATitle = hasEvents ? '(a) Rate of Drop per Drain Cycle' : '(a) Water Depth Profile Over Time';
+    const chartASubtitle = hasEvents
+      ? (eventsList.length > 0 ? 'Coloured by Diagnostic Status' : 'Derived from Sensor Drop Sequences')
+      : 'Bucketed Mean & Peak Water Depth (cm)';
+
+    const chartBTitle = hasEvents ? '(b) Status Breakdown' : '(b) Telemetry State Breakdown';
+    const chartBSubtitle = hasEvents ? 'Event Ratio Distribution' : 'Sensor FSM State Distribution';
+
+    const chartDTitle = hasEvents ? '(d) Initial Depth (H1) vs RoD Correlation' : '(d) Water Depth vs Sensor Distance';
+    const chartDSubtitle = hasEvents ? 'Hydraulic Head Pressure Effect' : 'Live Ultrasonic Calibration Scatter';
+
+    const chartETitle = hasEvents ? '(e) Rain Events Timeline' : '(e) Telemetry Volume Timeline';
+    const chartESubtitle = hasEvents ? 'Storm Cycle Frequency' : 'Captured Sensor Readings per Day';
+
+    const clearPctStr = Math.round((clearCount / Math.max(1, eventsSummary.total_rain_events || effectiveEvents.length)) * 100) + '%';
+
+    container.innerHTML = `
+      <!-- Header with Date Range Chips & Download Report Action -->
+      <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.25rem;">
+        <div>
+          <div style="display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;">
+            <h2 style="font-size: 1.3rem; font-weight: 800;">Hydraulic Diagnostic Analytics</h2>
+            <span class="badge badge-info" style="font-size: 0.72rem;">📡 ${escapeHTML(sourceBadgeText)}</span>
+          </div>
+          <p style="font-size: 0.85rem; color: var(--text-secondary);">Long-term rate of drop metrics, telemetry hydrology &amp; clog detection patterns</p>
+        </div>
+        
+        <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;" class="no-print">
+          <!-- Range Chips -->
+          <button class="btn ${days === 7 ? 'btn-primary' : 'btn-secondary'} btn-sm analytics-chip" data-days="7">7 Days</button>
+          <button class="btn ${days === 30 ? 'btn-primary' : 'btn-secondary'} btn-sm analytics-chip" data-days="30">30 Days</button>
+          <button class="btn ${days === 90 ? 'btn-primary' : 'btn-secondary'} btn-sm analytics-chip" data-days="90">90 Days</button>
+          
+          <!-- Download PDF Report Button -->
+          <button id="btn-print-analytics" class="btn btn-primary btn-sm" title="Download PDF Hydraulic Diagnostic Report">
+            <span>📄</span> Print / Download PDF
+          </button>
+        </div>
+      </div>
+
+      <!-- KPI Cards Grid -->
+      <div class="kpi-grid">
+        <div class="kpi-card">
+          <span class="kpi-title">${hasEvents ? 'Total Drain Events' : 'Telemetry Samples'}</span>
+          <span class="kpi-value">${hasEvents ? (eventsSummary.total_rain_events || effectiveEvents.length) : totalReadings}</span>
+          <span class="kpi-subtext">${hasEvents ? (eventsList.length > 0 ? `Hardware cycles (${totalReadings} pts)` : `Derived from ${totalReadings} readings`) : `Captured packets (${days}d)`}</span>
+        </div>
+        <div class="kpi-card">
+          <span class="kpi-title">${hasEvents ? 'Clear Drainage Rate' : 'Peak Water Depth'}</span>
+          <span class="kpi-value" style="color: ${hasEvents ? 'var(--color-clear)' : 'var(--accent-primary)'};">
+            ${hasEvents
+              ? clearPctStr
+              : `${peakWater.toFixed(1)} <span style="font-size: 0.9rem;">cm</span>`}
+          </span>
+          <span class="kpi-subtext">${hasEvents ? `Peak depth ${peakWater.toFixed(1)} cm` : `Max recorded depth (${days}d)`}</span>
+        </div>
+        <div class="kpi-card">
+          <span class="kpi-title">${hasEvents ? 'Average Rate of Drop' : 'Mean Water Depth'}</span>
+          <span class="kpi-value">
+            ${hasEvents
+              ? `${avgRodVal} <span style="font-size: 0.9rem;">cm/min</span>`
+              : `${avgWater.toFixed(1)} <span style="font-size: 0.9rem;">cm</span>`}
+          </span>
+          <span class="kpi-subtext">${hasEvents ? `Mean depth ${avgWater.toFixed(1)} cm` : `Baseline sensor level (${days}d)`}</span>
+        </div>
+        <div class="kpi-card">
+          <span class="kpi-title">Alerts &amp; Flood Flags</span>
+          <span class="kpi-value" style="color: ${(alertEventCount + floodRiskCount) > 0 ? 'var(--color-preclog)' : 'var(--color-clear)'};">${hasEvents ? alertEventCount : floodRiskCount}</span>
+          <span class="kpi-subtext">${hasEvents ? `Watch/pre-clog + ${floodRiskCount} flood flags` : 'High-water flood risk readings'}</span>
+        </div>
+      </div>
+
+      <!-- Month over Month Comparison Card -->
+      <div class="card" style="margin-bottom: 1.25rem;">
+        <div class="card-header">
+          <h3 class="card-title"><span>📅</span> ${hasEvents ? 'Period-Over-Period Drainage Velocity Trend' : 'Period-Over-Period Water Depth Comparison'}</h3>
+        </div>
+        ${renderMoMComparisonHTML(eventsSummary, effectiveEvents, rawReadings)}
+      </div>
+
+      <!-- Analytics Charts Grid: (a) RoD / Water Depth Bar Chart & (b) Doughnut Distribution -->
+      <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 1.25rem; margin-bottom: 1.25rem;">
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title"><span>📊</span> ${chartATitle}</h3>
+            <span class="card-subtitle">${chartASubtitle}</span>
+          </div>
+          <div class="chart-container">
+            <canvas id="chart-analytics-rod"></canvas>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title"><span>🍩</span> ${chartBTitle}</h3>
+            <span class="card-subtitle">${chartBSubtitle}</span>
+          </div>
+          <div class="chart-container">
+            <canvas id="chart-analytics-doughnut"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- Additional Charts Grid: (d) Scatter Plot & (e) Timeline Grouping -->
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem;">
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title"><span>🎯</span> ${chartDTitle}</h3>
+            <span class="card-subtitle">${chartDSubtitle}</span>
+          </div>
+          <div class="chart-container">
+            <canvas id="chart-analytics-scatter"></canvas>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title"><span>🌧️</span> ${chartETitle}</h3>
+            <span class="card-subtitle">${chartESubtitle}</span>
+          </div>
+          <div class="chart-container">
+            <canvas id="chart-analytics-weekly"></canvas>
+          </div>
+        </div>
+      </div>
+    `;
+
+    // Attach Range Chip clicks
+    document.querySelectorAll('.analytics-chip').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        state.analyticsDays = Number(e.target.getAttribute('data-days')) || 30;
+        renderAnalyticsTab();
+      });
+    });
+
+    // Attach Print / PDF Download handler
+    const printBtn = document.getElementById('btn-print-analytics');
+    if (printBtn) {
+      printBtn.addEventListener('click', () => {
+        downloadAnalyticsReport({
+          deviceId: state.currentDeviceId,
+          days,
+          hasEvents,
+          eventsList,
+          effectiveEvents,
+          rawReadings,
+          totalReadings,
+          avgWater,
+          peakWater,
+          avgRodVal,
+          clearPctStr,
+          alertEventCount,
+          floodRiskCount,
+          eventsSummary,
+          sourceBadgeText,
+          chartTitles: [chartATitle, chartBTitle, chartDTitle, chartETitle]
+        });
+      });
+    }
+
+    // Initialize all 4 charts (with full readings fallback + live event support)
+    initAnalyticsRodChart(effectiveEvents, rawReadings);
+    initAnalyticsDoughnutChart(effectiveEvents, eventsSummary, rawReadings);
+    initAnalyticsScatterChart(effectiveEvents, rawReadings);
+    initAnalyticsWeeklyChart(effectiveEvents, rawReadings);
+  }
+
+  /**
+   * Captures a Chart.js canvas onto an opaque dark background for clean PDF/HTML export
+   */
+  function captureChartImage(canvasId) {
+    const src = document.getElementById(canvasId);
+    if (!src || src.width === 0 || src.height === 0) return null;
+    try {
+      const tmp = document.createElement('canvas');
+      tmp.width = src.width;
+      tmp.height = src.height;
+      const tctx = tmp.getContext('2d');
+      tctx.fillStyle = '#111318';
+      tctx.fillRect(0, 0, tmp.width, tmp.height);
+      tctx.drawImage(src, 0, 0);
+      return tmp.toDataURL('image/png', 0.95);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * Generates & directly downloads a formatted PDF Diagnostic Report (with HTML document fallback)
+   */
+  function downloadAnalyticsReport(ctx) {
+    const btn = document.getElementById('btn-print-analytics');
+    const prevBtnHtml = btn ? btn.innerHTML : '';
+    if (btn) {
+      btn.disabled = true;
+      btn.innerHTML = '<span>⏳</span> Generating PDF...';
+    }
+
+    try {
+      const deviceObj = (state.devices || []).find(d => d.id === ctx.deviceId) || {};
+      const deviceName = sanitizeDeviceName(deviceObj.name, ctx.deviceId);
+      const locLabel = (state.liveLocation && state.liveLocation.label)
+        ? state.liveLocation.label
+        : (deviceObj.location || 'Field Deployment');
+      const nowIST = formatIST(new Date().toISOString());
+      const dateSlug = new Date().toISOString().slice(0, 10);
+      const chartIds = [
+        'chart-analytics-rod',
+        'chart-analytics-doughnut',
+        'chart-analytics-scatter',
+        'chart-analytics-weekly'
+      ];
+      const chartImages = chartIds.map((id, i) => ({
+        title: ctx.chartTitles[i] || `Chart ${i + 1}`,
+        img: captureChartImage(id)
+      }));
+
+      if (window.jspdf && typeof window.jspdf.jsPDF === 'function') {
+        const { jsPDF } = window.jspdf;
+        const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+
+        // Top Obsidian & Precision Yellow Header
+        doc.setFillColor(10, 10, 14);
+        doc.rect(0, 0, 210, 32, 'F');
+        doc.setFillColor(255, 214, 10);
+        doc.rect(0, 32, 210, 1.8, 'F');
+
+        doc.setTextColor(255, 214, 10);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(17);
+        doc.text('DrainGuard Hydraulic Diagnostic Report', 14, 14);
+
+        doc.setTextColor(220, 225, 232);
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(9.5);
+        doc.text(`Unit: ${deviceName} (${ctx.deviceId})  |  Location: ${locLabel}`, 14, 21.5);
+        doc.text(`Window: Past ${ctx.days} Days  |  Generated: ${nowIST}  |  ${ctx.sourceBadgeText}`, 14, 27);
+
+        // KPI Summary Row
+        let y = 41;
+        doc.setTextColor(20, 22, 28);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(11);
+        doc.text('Executive Telemetry Summary', 14, y);
+        y += 4;
+
+        const kpis = [
+          {
+            label: ctx.hasEvents ? 'Total Drain Events' : 'Telemetry Samples',
+            val: String(ctx.hasEvents ? (ctx.eventsSummary.total_rain_events || ctx.effectiveEvents.length) : ctx.totalReadings)
+          },
+          {
+            label: ctx.hasEvents ? 'Clear Drainage Rate' : 'Peak Water Depth',
+            val: ctx.hasEvents ? ctx.clearPctStr : `${ctx.peakWater.toFixed(1)} cm`
+          },
+          {
+            label: ctx.hasEvents ? 'Avg Rate of Drop' : 'Mean Water Depth',
+            val: ctx.hasEvents ? `${ctx.avgRodVal} cm/min` : `${ctx.avgWater.toFixed(1)} cm`
+          },
+          {
+            label: 'Alerts / Flood Flags',
+            val: String(ctx.hasEvents ? ctx.alertEventCount : ctx.floodRiskCount)
+          }
+        ];
+
+        const boxW = 43.5;
+        kpis.forEach((k, idx) => {
+          const x = 14 + idx * (boxW + 2.5);
+          doc.setFillColor(246, 247, 250);
+          doc.setDrawColor(215, 220, 228);
+          doc.roundedRect(x, y, boxW, 18, 2, 2, 'FD');
+          doc.setFont('helvetica', 'normal');
+          doc.setFontSize(7.5);
+          doc.setTextColor(95, 102, 115);
+          doc.text(k.label, x + 3, y + 6);
+          doc.setFont('helvetica', 'bold');
+          doc.setFontSize(12);
+          doc.setTextColor(15, 17, 21);
+          doc.text(k.val, x + 3, y + 14);
+        });
+
+        y += 25;
+        const uptimeStr = ctx.eventsSummary.uptime_pct !== undefined ? `${ctx.eventsSummary.uptime_pct}%` : '--';
+        const rssiStr = ctx.eventsSummary.avg_rssi !== null && ctx.eventsSummary.avg_rssi !== undefined ? `${ctx.eventsSummary.avg_rssi} dBm` : '--';
+        doc.setFont('helvetica', 'normal');
+        doc.setFontSize(8.5);
+        doc.setTextColor(70, 75, 86);
+        doc.text(`Mean Depth: ${ctx.avgWater.toFixed(1)} cm   |   Peak Depth: ${ctx.peakWater.toFixed(1)} cm   |   Avg Signal: ${rssiStr}   |   Estimated Uptime: ${uptimeStr}`, 14, y);
+
+        // Embed up to 4 rendered Chart canvases (2x2 grid)
+        y += 7;
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(11);
+        doc.setTextColor(20, 22, 28);
+        doc.text('Diagnostic Charts & Telemetry Distributions', 14, y);
+        y += 4;
+
+        const cw = 88;
+        const ch = 56;
+        chartImages.forEach((c, idx) => {
+          const col = idx % 2;
+          const row = Math.floor(idx / 2);
+          const cx = 14 + col * (cw + 6);
+          const cy = y + row * (ch + 12);
+
+          doc.setFont('helvetica', 'bold');
+          doc.setFontSize(8);
+          doc.setTextColor(50, 55, 65);
+          doc.text(c.title, cx, cy + 4);
+
+          if (c.img) {
+            doc.addImage(c.img, 'PNG', cx, cy + 6, cw, ch);
+          } else {
+            doc.setDrawColor(210, 215, 224);
+            doc.rect(cx, cy + 6, cw, ch);
+            doc.setFont('helvetica', 'normal');
+            doc.text('Chart snapshot unavailable', cx + 18, cy + 34);
+          }
+        });
+
+        // Page 2: Recent Drain Events or Telemetry Log Table
+        doc.addPage();
+        doc.setFillColor(10, 10, 14);
+        doc.rect(0, 0, 210, 16, 'F');
+        doc.setFillColor(255, 214, 10);
+        doc.rect(0, 16, 210, 1.2, 'F');
+        doc.setTextColor(255, 214, 10);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(11);
+        doc.text(
+          ctx.effectiveEvents.length > 0 ? 'Drainage Rate-of-Drop Event Log' : 'Recent Raw Telemetry Readings',
+          14,
+          10.5
+        );
+
+        let ty = 26;
+        doc.setTextColor(20, 22, 28);
+        doc.setFontSize(8);
+        if (ctx.effectiveEvents.length > 0) {
+          const rows = [...ctx.effectiveEvents]
+            .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+            .slice(0, 22);
+          doc.text('Timestamp (IST)', 14, ty);
+          doc.text('H1 (cm)', 78, ty);
+          doc.text('H2 (cm)', 98, ty);
+          doc.text('Dur (s)', 118, ty);
+          doc.text('RoD (cm/min)', 138, ty);
+          doc.text('Status', 174, ty);
+          ty += 2;
+          doc.setDrawColor(190, 195, 205);
+          doc.line(14, ty, 196, ty);
+          ty += 5;
+
+          doc.setFont('helvetica', 'normal');
+          rows.forEach(ev => {
+            doc.text(formatIST(ev.created_at).slice(0, 24), 14, ty);
+            doc.text(Number(ev.h1_cm || 0).toFixed(1), 78, ty);
+            doc.text(Number(ev.h2_cm || 0).toFixed(1), 98, ty);
+            doc.text(String(ev.duration_s || 0), 118, ty);
+            doc.text(Number(ev.rod_cm_min || 0).toFixed(2), 138, ty);
+            doc.text(String(ev.status || '--'), 174, ty);
+            ty += 6.5;
+          });
+        } else {
+          const rows = [...ctx.rawReadings].reverse().slice(0, 22);
+          doc.text('Timestamp (IST)', 14, ty);
+          doc.text('State', 78, ty);
+          doc.text('Water (cm)', 106, ty);
+          doc.text('Dist (cm)', 134, ty);
+          doc.text('Flood Risk', 162, ty);
+          doc.text('RSSI', 184, ty);
+          ty += 2;
+          doc.setDrawColor(190, 195, 205);
+          doc.line(14, ty, 196, ty);
+          ty += 5;
+
+          doc.setFont('helvetica', 'normal');
+          rows.forEach(r => {
+            doc.text(formatIST(r.created_at).slice(0, 24), 14, ty);
+            doc.text(String(r.state || '--'), 78, ty);
+            doc.text(r.water_cm != null ? Number(r.water_cm).toFixed(1) : '--', 106, ty);
+            doc.text(r.distance_cm != null ? Number(r.distance_cm).toFixed(1) : '--', 134, ty);
+            doc.text(r.flood_risk ? 'RISK' : 'OK', 162, ty);
+            doc.text(r.rssi != null ? `${r.rssi}` : '--', 184, ty);
+            ty += 6.5;
+          });
+        }
+
+        const filename = `DrainGuard_Report_${ctx.deviceId}_${ctx.days}d_${dateSlug}.pdf`;
+        doc.save(filename);
+        showToast(`PDF Report downloaded: ${filename}`, 'success');
+      } else {
+        // Offline / blocked-CDN fallback: download clean self-contained HTML report + open print
+        const htmlDoc = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>DrainGuard Report - ${escapeHTML(ctx.deviceId)}</title><style>body{font-family:Arial,sans-serif;padding:24px;color:#111;background:#fff}h1{border-bottom:3px solid #ffd60a;padding-bottom:8px}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin:16px 0}.kpi{border:1px solid #ddd;border-radius:8px;padding:12px}img{width:100%;border-radius:8px;border:1px solid #ccc}</style></head><body><h1>DrainGuard Hydraulic Diagnostic Report</h1><p><strong>Unit:</strong> ${escapeHTML(deviceName)} (${escapeHTML(ctx.deviceId)}) | <strong>Location:</strong> ${escapeHTML(locLabel)} | <strong>Window:</strong> ${ctx.days} Days | <strong>Generated:</strong> ${escapeHTML(nowIST)}</p><div class="grid"><div class="kpi"><strong>${ctx.hasEvents ? 'Drain Events' : 'Telemetry Samples'}:</strong> ${ctx.hasEvents ? ctx.effectiveEvents.length : ctx.totalReadings}</div><div class="kpi"><strong>Peak Water Depth:</strong> ${ctx.peakWater.toFixed(1)} cm</div><div class="kpi"><strong>Mean Water Depth:</strong> ${ctx.avgWater.toFixed(1)} cm</div><div class="kpi"><strong>Flood Risk Flags:</strong> ${ctx.floodRiskCount}</div></div><div class="grid">${chartImages.filter(c => c.img).map(c => `<div><h3>${escapeHTML(c.title)}</h3><img src="${c.img}" alt="${escapeHTML(c.title)}"></div>`).join('')}</div></body></html>`;
+        const blob = new Blob([htmlDoc], { type: 'text/html;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `DrainGuard_Report_${ctx.deviceId}_${ctx.days}d_${dateSlug}.html`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        showToast('Report document downloaded (HTML)', 'success');
+        window.print();
+      }
+    } catch (err) {
+      console.error('[Report] Export failed:', err);
+      showToast(`Report download error: ${err.message}`, 'error');
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = prevBtnHtml;
+      }
     }
   }
 
@@ -2596,28 +2923,12 @@
     const container = document.getElementById('tab-trends');
     if (!container) return;
 
-    const alreadyHasTrendsDOM = Boolean(document.getElementById('chart-trends-water') && document.getElementById('chart-trends-ratio'));
-    if (!silent || !alreadyHasTrendsDOM) {
-      showSkeleton('tab-trends', 'Analyzing long-term rate of drop degradation trends...');
-    }
+    const deviceId = state.currentDeviceId;
+    const range = state.trendsRange;
+    const cacheKey = `${deviceId}_${range}`;
+    const cached = tabCache.trends[cacheKey];
 
-    try {
-      const rangeCfg = getTrendRangeConfig(state.trendsRange);
-      const fromDate = new Date(Date.now() - rangeCfg.ms).toISOString();
-
-      const [trendData, configData, readingsRes] = await Promise.all([
-        API.getAnalyticsTrend(state.currentDeviceId, rangeCfg.days),
-        API.getDeviceOverview(state.currentDeviceId),
-        API.getReadings({
-          device_id: state.currentDeviceId,
-          from: fromDate,
-          bucket: rangeCfg.bucket,
-          pageSize: 300,
-          limit: 300
-        }).catch(() => ({ data: [] }))
-      ]);
-
-      const trend = trendData || {};
+    const paintTrends = ({ trend, configData, readingsRes, fromDate, rangeCfg }) => {
       const config = (configData && configData.config) || {};
       const fromMs = new Date(fromDate).getTime();
 
@@ -2644,11 +2955,9 @@
 
       const waterSeries = normalizedFetched.length >= 2 ? normalizedFetched : (backendSeries.length > 0 ? backendSeries : normalizedFetched);
 
-      // Filter RoD events strictly into the selected time window
       const allTrendPoints = trend.events || trend.points || [];
       const points = allTrendPoints.filter(p => !p.created_at || new Date(p.created_at).getTime() >= fromMs);
 
-      // Compute instantaneous dH/dt velocity (cm/min) across waterSeries
       const velocitySeries = [];
       for (let i = 1; i < waterSeries.length; i++) {
         const prev = waterSeries[i - 1];
@@ -2684,9 +2993,9 @@
             : (latestRate <= -0.25
               ? `actively draining (${latestRate.toFixed(2)} cm/min)`
               : 'currently steady');
-          insightText = `Analyzed ${waterSeries.length} points in the ${state.trendsRange} window: depth is ${latestWater.toFixed(1)} cm (${directionStr}; mean ${avgWater.toFixed(1)} cm, peak ${peakWater.toFixed(1)} cm, net shift ${netShift >= 0 ? '+' : ''}${netShift.toFixed(1)} cm). Linear RoD degradation regression unlocks after 2+ full drain drop cycles.`;
+          insightText = `Analyzed ${waterSeries.length} points in the ${range} window: depth is ${latestWater.toFixed(1)} cm (${directionStr}; mean ${avgWater.toFixed(1)} cm, peak ${peakWater.toFixed(1)} cm, net shift ${netShift >= 0 ? '+' : ''}${netShift.toFixed(1)} cm). Linear RoD degradation regression unlocks after 2+ full drain drop cycles.`;
         } else {
-          insightText = `Awaiting more telemetry packets in the ${state.trendsRange} window. Try switching to 24h or 7d if no readings arrived in the last hour.`;
+          insightText = `Awaiting more telemetry packets in the ${range} window. Try switching to 24h or 7d if no readings arrived in the last hour.`;
         }
       }
 
@@ -2695,26 +3004,24 @@
       const hasRegressionPoints = points && points.length >= 2;
 
       container.innerHTML = `
-        <!-- Time Range Selector -->
         <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.25rem;">
           <div>
             <div style="display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;">
               <h2 style="font-size: 1.3rem; font-weight: 800;">Degradation &amp; Velocity Trends</h2>
-              <span class="badge badge-info" style="font-size: 0.72rem;">📡 Live 10s Sync (${escapeHTML(state.trendsRange)})</span>
+              <span class="badge badge-info" style="font-size: 0.72rem;">📡 Live 10s Sync (${escapeHTML(range)})</span>
             </div>
             <p style="font-size: 0.85rem; color: var(--text-secondary);">Predictive linear regression, live dH/dt flow velocity &amp; clogging projection models</p>
           </div>
 
           <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
-            <button class="btn ${state.trendsRange === '1h' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="1h">1h</button>
-            <button class="btn ${state.trendsRange === '6h' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="6h">6h</button>
-            <button class="btn ${state.trendsRange === '24h' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="24h">24h</button>
-            <button class="btn ${state.trendsRange === '7d' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="7d">7d</button>
-            <button class="btn ${state.trendsRange === '30d' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="30d">30d</button>
+            <button class="btn ${range === '1h' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="1h">1h</button>
+            <button class="btn ${range === '6h' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="6h">6h</button>
+            <button class="btn ${range === '24h' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="24h">24h</button>
+            <button class="btn ${range === '7d' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="7d">7d</button>
+            <button class="btn ${range === '30d' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="30d">30d</button>
           </div>
         </div>
 
-        <!-- Predictive AI / Regression Insight Card -->
         <div class="card" style="margin-bottom: 1.25rem; border-left: 5px solid ${isDeclining ? 'var(--color-watch)' : 'var(--color-clear)'};">
           <div style="display: flex; align-items: flex-start; gap: 0.85rem; flex-wrap: wrap;">
             <span style="font-size: 1.8rem;">${isDeclining ? '⚠️' : '💡'}</span>
@@ -2722,7 +3029,7 @@
               <h4 style="font-size: 1rem; margin-bottom: 0.25rem;">Predictive Maintenance Diagnostic</h4>
               <p style="font-size: 0.85rem; color: var(--text-secondary); line-height: 1.45;">${escapeHTML(insightText)}</p>
               <div style="display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.65rem;">
-                <span class="badge badge-info">📡 ${readingCount} Points (${escapeHTML(state.trendsRange)})</span>
+                <span class="badge badge-info">📡 ${readingCount} Points (${escapeHTML(range)})</span>
                 <span class="badge clear">Latest: ${latestWater.toFixed(1)} cm</span>
                 <span class="badge clear">Mean: ${avgWater.toFixed(1)} cm</span>
                 <span class="badge ${peakWater >= (Number(config.rain_start_cm) || 10) ? 'watch' : 'clear'}">Peak: ${peakWater.toFixed(1)} cm</span>
@@ -2739,10 +3046,9 @@
           </div>
         </div>
 
-        <!-- Water Level Downsampled Trend Chart -->
         <div class="card" style="margin-bottom: 1.25rem;">
           <div class="card-header">
-            <h3 class="card-title"><span>🌊</span> Water Level Profile with Rain Threshold (${escapeHTML(state.trendsRange)})</h3>
+            <h3 class="card-title"><span>🌊</span> Water Level Profile with Rain Threshold (${escapeHTML(range)})</h3>
             <span class="card-subtitle">${rangeCfg.bucket === 'raw' ? 'Full-Resolution Telemetry' : `Bucketed (${rangeCfg.bucket}) Time-Series`}</span>
           </div>
           <div class="chart-container">
@@ -2750,7 +3056,6 @@
           </div>
         </div>
 
-        <!-- RoD Ratio Regression OR Live dH/dt Flow Velocity Chart -->
         <div class="card">
           <div class="card-header">
             <h3 class="card-title"><span>📉</span> ${hasRegressionPoints ? 'Rate of Drop Ratio Trend &amp; Slope' : 'Live Inflow &amp; Drainage Velocity (dH/dt)'}</h3>
@@ -2762,7 +3067,6 @@
         </div>
       `;
 
-      // Attach Range buttons
       document.querySelectorAll('.trends-range-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
           state.trendsRange = e.target.getAttribute('data-range') || '24h';
@@ -2770,10 +3074,41 @@
         });
       });
 
-      // Initialize trend charts
       initTrendsWaterChart(waterSeries, config);
       initTrendsRatioChart(points, trend, waterSeries, config, velocitySeries);
+    };
 
+    const alreadyHasTrendsDOM = Boolean(document.getElementById('chart-trends-water') && document.getElementById('chart-trends-ratio'));
+    if (!silent && cached) {
+      paintTrends(cached.payload);
+      if (Date.now() - cached.ts <= 8000) return;
+      silent = true;
+    } else if (!silent || !alreadyHasTrendsDOM) {
+      showSkeleton('tab-trends', 'Streaming velocity regression & hydrological profiles...');
+    }
+
+    try {
+      const rangeCfg = getTrendRangeConfig(range);
+      const fromDate = new Date(Date.now() - rangeCfg.ms).toISOString();
+      const hasWarmConfig = state.activeOverview && state.activeOverview.device && state.activeOverview.device.id === deviceId && state.activeOverview.config;
+
+      const [trendData, configData, readingsRes] = await Promise.all([
+        API.getAnalyticsTrend(deviceId, rangeCfg.days),
+        hasWarmConfig ? Promise.resolve(state.activeOverview) : API.getDeviceOverview(deviceId),
+        API.getReadings({
+          device_id: deviceId,
+          from: fromDate,
+          bucket: rangeCfg.bucket,
+          pageSize: 300,
+          limit: 300
+        }).catch(() => ({ data: [] }))
+      ]);
+
+      const payload = { trend: trendData || {}, configData, readingsRes, fromDate, rangeCfg };
+      tabCache.trends[cacheKey] = { payload, ts: Date.now() };
+      if (state.activeTab === 'trends' && state.currentDeviceId === deviceId && state.trendsRange === range) {
+        paintTrends(payload);
+      }
     } catch (err) {
       console.error('[Trends] Render failed:', err);
       if (!silent) {
@@ -3061,9 +3396,7 @@
       </div>
 
       <!-- Table Container -->
-      <div id="history-table-container">
-        <div class="skeleton-loader">Loading records...</div>
-      </div>
+      <div id="history-table-container"></div>
     `;
 
     // Attach Subtab listeners
@@ -3560,12 +3893,10 @@
     const container = document.getElementById('tab-alerts');
     if (!container) return;
 
-    showSkeleton('tab-alerts', 'Fetching active operator alerts & fault logs...');
+    const deviceId = state.currentDeviceId;
+    const cached = tabCache.alerts[deviceId];
 
-    try {
-      const res = await API.getAlerts({ device_id: state.currentDeviceId, pageSize: 100 });
-      const alerts = Array.isArray(res) ? res : (res.data || res.alerts || []);
-
+    const paintAlerts = (alerts) => {
       container.innerHTML = `
         <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.25rem;">
           <div>
@@ -3573,7 +3904,6 @@
             <p style="font-size: 0.85rem; color: var(--text-secondary);">Threshold breaches, flood risks, and hardware fault notifications</p>
           </div>
 
-          <!-- Alert Filters -->
           <div style="display: flex; gap: 0.5rem;" class="no-print">
             <button class="btn btn-primary btn-sm alert-filter-btn" data-filter="all">All</button>
             <button class="btn btn-secondary btn-sm alert-filter-btn" data-filter="open">Open</button>
@@ -3587,7 +3917,6 @@
         </div>
       `;
 
-      // Filter button handlers
       container.querySelectorAll('.alert-filter-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
           container.querySelectorAll('.alert-filter-btn').forEach(b => {
@@ -3604,7 +3933,30 @@
       });
 
       attachAlertActionHandlers(alerts);
+    };
 
+    if (cached) {
+      paintAlerts(cached.alerts);
+      if (Date.now() - cached.ts <= 8000) return;
+      API.getAlerts({ device_id: deviceId, pageSize: 100 })
+        .then(res => {
+          const alerts = Array.isArray(res) ? res : (res.data || res.alerts || []);
+          tabCache.alerts[deviceId] = { alerts, ts: Date.now() };
+          if (state.activeTab === 'alerts' && state.currentDeviceId === deviceId) {
+            paintAlerts(alerts);
+          }
+        })
+        .catch(() => {});
+      return;
+    }
+
+    showSkeleton('tab-alerts', 'Scanning active fault & threshold alerts...');
+
+    try {
+      const res = await API.getAlerts({ device_id: deviceId, pageSize: 100 });
+      const alerts = Array.isArray(res) ? res : (res.data || res.alerts || []);
+      tabCache.alerts[deviceId] = { alerts, ts: Date.now() };
+      paintAlerts(alerts);
     } catch (err) {
       console.error('[Alerts] Render failed:', err);
       showError('tab-alerts', `Failed to load alerts: ${err.message}`, renderAlertsTab);
@@ -3708,10 +4060,17 @@
     const container = document.getElementById('tab-settings');
     if (!container) return;
 
-    showSkeleton('tab-settings', 'Loading sensor calibration & threshold parameters...');
+    const deviceId = state.currentDeviceId;
+    const warmOverview = state.activeOverview && state.activeOverview.device && state.activeOverview.device.id === deviceId
+      ? state.activeOverview
+      : null;
+
+    if (!warmOverview) {
+      showSkeleton('tab-settings', 'Syncing sensor calibration & threshold parameters...');
+    }
 
     try {
-      const overview = await API.getDeviceOverview(state.currentDeviceId);
+      const overview = warmOverview || await API.getDeviceOverview(deviceId);
       const device = overview.device || {};
       const config = overview.config || {};
       const isAdmin = Boolean(state.adminKey);
