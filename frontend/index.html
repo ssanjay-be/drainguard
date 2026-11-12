@@ -1,17 +1,22 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0">
-  <title>DrainGuard - Predictive Drain Clog Diagnostic</title>
+  <meta name="theme-color" content="#070709">
+  <title>DrainGuard — Predictive Stormwater Clog Diagnostic</title>
 
-  <!-- Favicon using SVG Cloud with Rain -->
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌧️</text></svg>">
+  <!-- Preconnect to Render API & CDNs for faster initial handshake -->
+  <link rel="preconnect" href="https://drainguard-by4m.onrender.com" crossorigin>
+  <link rel="dns-prefetch" href="https://drainguard-by4m.onrender.com">
 
-  <!-- Google Fonts: Inter + JetBrains Mono -->
+  <!-- Favicon using Black + Yellow Dual-Tone SVG -->
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%230a0a0c'/><rect x='6' y='6' width='88' height='88' rx='18' fill='none' stroke='%23FFD60A' stroke-width='6'/><text x='50' y='68' font-size='54' text-anchor='middle' fill='%23FFD60A'>⚡</text></svg>">
+
+  <!-- Google Fonts: Plus Jakarta Sans + Inter + JetBrains Mono -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet">
 
   <!-- Application Stylesheet -->
   <link rel="stylesheet" href="style.css">
@@ -29,14 +34,22 @@
 </head>
 <body>
 
+  <!-- Ambient Top Dual-Tone Lighting -->
+  <div class="ambient-glow" aria-hidden="true"></div>
+
   <!-- ─── 1. Header Bar ───────────────────────────────────────── -->
   <header class="app-header">
     <div class="header-container">
       <!-- Brand & Title -->
       <div class="brand-wrapper">
-        <span class="brand-logo" aria-hidden="true">🌧️</span>
+        <div class="brand-emblem" aria-hidden="true">
+          <span class="brand-logo">🌧️</span>
+        </div>
         <div>
-          <h1 class="brand-title">DrainGuard</h1>
+          <div class="brand-title-row">
+            <h1 class="brand-title">DrainGuard</h1>
+            <span class="brand-chip">LIVE TELEMETRY</span>
+          </div>
           <span class="brand-subtitle">Predictive Stormwater Clog Diagnostic</span>
         </div>
       </div>
@@ -45,9 +58,9 @@
       <div class="header-controls">
         <!-- Device Selector -->
         <div class="device-select-wrapper" title="Select monitored drain unit">
-          <label for="device-select" class="device-select-label">Device:</label>
+          <label for="device-select" class="device-select-label">Unit</label>
           <select id="device-select" class="device-select" aria-label="Select device">
-            <option value="">Loading devices...</option>
+            <option value="">Connecting...</option>
           </select>
         </div>
 
@@ -57,9 +70,9 @@
           <span id="last-seen-text">Checking...</span>
         </div>
 
-        <!-- Theme Toggle (Light / Dark) -->
-        <button id="theme-toggle" class="btn-icon" aria-label="Toggle light or dark theme" title="Toggle theme">
-          <span id="theme-icon">☀️</span>
+        <!-- Theme Toggle (Dark Obsidian / Light Gold) -->
+        <button id="theme-toggle" class="btn-icon" aria-label="Toggle dark or light theme" title="Toggle Obsidian / Daylight theme">
+          <span id="theme-icon">🌙</span>
         </button>
 
         <!-- Admin Mode Button / Lock -->
@@ -80,42 +93,42 @@
     <button id="alert-banner-action" class="alert-banner-btn">View Alerts</button>
   </div>
 
-  <!-- ─── 3. Cold-Start Server Wakeup Message ─────────────────── -->
-  <div id="cold-start-msg" role="status">
+  <!-- ─── 3. Cold-Start Server Wakeup Message (Hidden unless >2s) ─ -->
+  <div id="cold-start-msg" hidden role="status">
     <span class="spinner" aria-hidden="true"></span>
-    <span>Waking up the server... this can take up to 60 seconds on free cloud hosting.</span>
+    <span>Waking telemetry server... live data will appear momentarily.</span>
   </div>
 
   <!-- ─── 4. Navigation Tab Bar ───────────────────────────────── -->
   <nav class="tabs-nav-bar" aria-label="Main Navigation">
     <div class="tabs-container" role="tablist">
       <button class="tab-btn active" data-tab="overview" role="tab" aria-selected="true" id="tab-btn-overview">
-        <span>📊</span> Overview
+        <span class="tab-icon">📊</span> Overview
       </button>
       <button class="tab-btn" data-tab="analytics" role="tab" aria-selected="false" id="tab-btn-analytics">
-        <span>📈</span> Analytics
+        <span class="tab-icon">📈</span> Analytics
       </button>
       <button class="tab-btn" data-tab="trends" role="tab" aria-selected="false" id="tab-btn-trends">
-        <span>📉</span> Trends
+        <span class="tab-icon">📉</span> Trends
       </button>
       <button class="tab-btn" data-tab="history" role="tab" aria-selected="false" id="tab-btn-history">
-        <span>📜</span> History
+        <span class="tab-icon">📜</span> History
       </button>
       <button class="tab-btn" data-tab="alerts" role="tab" aria-selected="false" id="tab-btn-alerts">
-        <span>🔔</span> Alerts
+        <span class="tab-icon">🔔</span> Alerts
       </button>
       <button class="tab-btn" data-tab="settings" role="tab" aria-selected="false" id="tab-btn-settings">
-        <span>⚙️</span> Settings
+        <span class="tab-icon">⚙️</span> Settings
       </button>
     </div>
   </nav>
 
   <!-- ─── 5. Tab Panels Container ─────────────────────────────── -->
   <main class="main-content">
-    
+
     <!-- Tab 1: Overview -->
     <div class="tab-panel active" id="tab-overview" role="tabpanel" aria-labelledby="tab-btn-overview">
-      <div class="skeleton-loader">Loading Overview telemetry...</div>
+      <div class="skeleton-loader">Syncing DrainGuard telemetry...</div>
     </div>
 
     <!-- Tab 2: Analytics -->
@@ -147,7 +160,7 @@
 
   <!-- ─── 6. Footer ───────────────────────────────────────────── -->
   <footer class="app-footer">
-    <p>⚡ DrainGuard v1.0 — Predictive Stormwater Clog Diagnostic System | Built for Greater Chennai Corporation</p>
+    <p>⚡ DrainGuard — Predictive Stormwater Clog Diagnostic System | Built for Greater Chennai Corporation</p>
   </footer>
 
   <!-- ─── 7. Toast Container ──────────────────────────────────── -->
@@ -187,11 +200,8 @@
   </div>
 
   <!-- ─── 10. Application Scripts ─────────────────────────────── -->
-  <!-- Configuration FIRST -->
   <script src="config.js"></script>
-  <!-- API Client Service SECOND -->
   <script src="api.js"></script>
-  <!-- Main Application Logic THIRD -->
   <script src="app.js"></script>
 
 </body>

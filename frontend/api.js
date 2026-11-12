@@ -46,43 +46,58 @@ window.API = (function() {
   /**
    * Cold-start retry mechanism:
    * Retries on network disconnection / fetch failure (common during Render server spin-up).
+   * Only reveals #cold-start-msg if the request actually exceeds 2.2s.
    *
    * @param {string} url - Target URL
    * @param {Object} options - Fetch options (method, headers, body)
    * @param {number} retries - Maximum retry count (default 3)
-   * @param {number} delayMs - Delay between attempts (default 5000ms)
+   * @param {number} delayMs - Initial delay between attempts (default 1500ms)
    * @returns {Promise<Response>} Fetch Response object
    */
-  async function fetchWithRetry(url, options = {}, retries = 3, delayMs = 5000) {
+  async function fetchWithRetry(url, options = {}, retries = 3, delayMs = 1500) {
     let lastError = null;
+    const coldStartBanner = document.getElementById('cold-start-msg');
+    const slowTimer = setTimeout(() => {
+      if (coldStartBanner) coldStartBanner.hidden = false;
+    }, 2200);
 
-    for (let attempt = 0; attempt <= retries; attempt++) {
-      try {
-        const response = await fetch(url, options);
+    try {
+      for (let attempt = 0; attempt <= retries; attempt++) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 16000);
 
-        // If the server responded with 502/503/504 while waking up, treat as retryable
-        if ([502, 503, 504].includes(response.status) && attempt < retries) {
-          console.warn(`[API] Server waking up (${response.status}). Retrying in ${delayMs / 1000}s... (attempt ${attempt + 1}/${retries})`);
-          await delay(delayMs);
-          continue;
-        }
+        try {
+          const response = await fetch(url, { ...options, signal: controller.signal });
+          clearTimeout(timeoutId);
 
-        // On any successful response (or standard HTTP error), server is awake
-        if (window.onServerAwake && typeof window.onServerAwake === 'function') {
-          window.onServerAwake();
-        }
+          // If the server responded with 502/503/504 while waking up, treat as retryable
+          if ([502, 503, 504].includes(response.status) && attempt < retries) {
+            const waitMs = delayMs * (attempt + 1);
+            console.warn(`[API] Server waking up (${response.status}). Retrying in ${waitMs / 1000}s... (attempt ${attempt + 1}/${retries})`);
+            await delay(waitMs);
+            continue;
+          }
 
-        return response;
-      } catch (err) {
-        lastError = err;
-        console.warn(`[API] Network error calling ${url}: ${err.message}. (attempt ${attempt + 1}/${retries})`);
-        if (attempt < retries) {
-          await delay(delayMs);
+          // Server is awake
+          if (window.onServerAwake && typeof window.onServerAwake === 'function') {
+            window.onServerAwake();
+          }
+
+          return response;
+        } catch (err) {
+          clearTimeout(timeoutId);
+          lastError = err;
+          console.warn(`[API] Network error calling ${url}: ${err.message}. (attempt ${attempt + 1}/${retries})`);
+          if (attempt < retries) {
+            await delay(delayMs * (attempt + 1));
+          }
         }
       }
-    }
 
-    throw lastError || new Error(`Network request failed after ${retries} attempts`);
+      throw lastError || new Error(`Network request failed after ${retries} attempts`);
+    } finally {
+      clearTimeout(slowTimer);
+    }
   }
 
   /**

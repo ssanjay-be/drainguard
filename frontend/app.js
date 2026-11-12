@@ -23,6 +23,12 @@
   'use strict';
 
   // ─── 1. Application State ──────────────────────────────────────────────────
+  let savedLiveGeo = null;
+  try {
+    const rawGeo = localStorage.getItem('drainGuardLiveLocation');
+    if (rawGeo) savedLiveGeo = JSON.parse(rawGeo);
+  } catch (_) {}
+
   const state = {
     currentDeviceId: null,
     devices: [],
@@ -31,6 +37,8 @@
     adminKey: sessionStorage.getItem('adminKey') || sessionStorage.getItem('drainGuardAdminKey') || null,
     knownAlertIds: new Set(),
     activeOverview: null,
+    liveLocation: savedLiveGeo, // { lat, lng, label, source, updatedAt }
+    locationDetecting: false,
     historySubtab: 'events', // 'events' or 'readings'
     historyEventsPage: 1,
     historyEventsLimit: 10,
@@ -47,6 +55,8 @@
   // Registry to hold active Chart.js and Leaflet instances for safe cleanup
   const chartRegistry = {};
   let leafletMapInstance = null;
+  let leafletMarkerInstance = null;
+  let renderedOverviewDeviceId = null;
 
   // ─── 2. Shared Formatting & UI Utilities ───────────────────────────────────
 
@@ -272,21 +282,207 @@
   }
   window.onServerAwake = hideColdStartMsg;
 
+  /**
+   * Normalizes legacy seed/placeholder names so project UI never shows "Demo Drain"
+   */
+  function sanitizeDeviceName(name, id) {
+    if (!name || /demo drain|mock pvc/i.test(name)) {
+      return id === 'drain-01' ? 'DrainGuard Unit 01' : `DrainGuard Unit (${id || '01'})`;
+    }
+    return name;
+  }
+
+  /**
+   * Resolves effective device location: adaptive live GPS/device location if available,
+   * otherwise falls back to saved device metadata.
+   */
+  function getEffectiveLocation(device) {
+    if (state.liveLocation && typeof state.liveLocation.lat === 'number' && typeof state.liveLocation.lng === 'number') {
+      return {
+        lat: state.liveLocation.lat,
+        lng: state.liveLocation.lng,
+        label: state.liveLocation.label || `${state.liveLocation.lat.toFixed(4)}°, ${state.liveLocation.lng.toFixed(4)}°`,
+        isLive: true,
+        source: state.liveLocation.source || 'gps'
+      };
+    }
+    const rawLoc = device && device.location;
+    const label = (!rawLoc || rawLoc === 'Chennai') ? 'Active Field Site' : rawLoc;
+    return {
+      lat: device && device.lat ? Number(device.lat) : 13.0827,
+      lng: device && device.lng ? Number(device.lng) : 80.2707,
+      label,
+      isLive: false,
+      source: 'stored'
+    };
+  }
+
+  /**
+   * Reverse-geocodes coordinates using OpenStreetMap Nominatim (with coordinate fallback)
+   */
+  async function reverseGeocode(lat, lng) {
+    try {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 5000);
+      const res = await fetch(
+        `https://nominatim.openstreetmap.org/reverse?format=json&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lng)}&zoom=14`,
+        { headers: { 'Accept': 'application/json' }, signal: controller.signal }
+      );
+      clearTimeout(t);
+      if (res.ok) {
+        const geo = await res.json();
+        const addr = geo.address || {};
+        const area = addr.suburb || addr.neighbourhood || addr.city_district || addr.town || addr.village;
+        const city = addr.city || addr.state_district || addr.state;
+        if (area && city && area !== city) return `${area}, ${city}`;
+        if (city || area) return city || area;
+      }
+    } catch (_) {
+      // Fallback to crisp coordinates
+    }
+    return `${lat.toFixed(4)}° N, ${lng.toFixed(4)}° E`;
+  }
+
+  /**
+   * Detects the current physical location of the device viewing/hosting the dashboard
+   * Uses Browser Geolocation first, then falls back to lightweight IP geolocation if needed.
+   */
+  async function detectCurrentLocation(silent = true) {
+    if (state.locationDetecting) return state.liveLocation;
+    state.locationDetecting = true;
+
+    const applyCoords = async (lat, lng, source) => {
+      const label = await reverseGeocode(lat, lng);
+      state.liveLocation = {
+        lat: Number(lat),
+        lng: Number(lng),
+        label,
+        source,
+        updatedAt: Date.now()
+      };
+      try {
+        localStorage.setItem('drainGuardLiveLocation', JSON.stringify(state.liveLocation));
+      } catch (_) {}
+
+      // Smoothly update selector dropdown & active overview map/labels without full reload
+      populateDeviceSelector();
+      updateAdaptiveLocationUI();
+      if (!silent) {
+        showToast(`Location synced: ${label}`, 'success');
+      }
+      return state.liveLocation;
+    };
+
+    try {
+      if (navigator.geolocation) {
+        const pos = await new Promise((resolve, reject) => {
+          navigator.geolocation.getCurrentPosition(resolve, reject, {
+            enableHighAccuracy: true,
+            timeout: 7000,
+            maximumAge: 60000
+          });
+        });
+        return await applyCoords(pos.coords.latitude, pos.coords.longitude, 'gps');
+      }
+    } catch (geoErr) {
+      if (!silent) {
+        console.warn('[Location] GPS unavailable/denied, trying network lookup:', geoErr.message);
+      }
+    }
+
+    // Fallback: IP-based approximate location (only if no GPS fix yet)
+    try {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 5000);
+      const res = await fetch('https://ipwho.is/', { signal: controller.signal });
+      clearTimeout(t);
+      if (res.ok) {
+        const data = await res.json();
+        if (data && data.success !== false && data.latitude && data.longitude) {
+          const label = [data.city, data.region].filter(Boolean).join(', ') || `${Number(data.latitude).toFixed(4)}°, ${Number(data.longitude).toFixed(4)}°`;
+          state.liveLocation = {
+            lat: Number(data.latitude),
+            lng: Number(data.longitude),
+            label,
+            source: 'network',
+            updatedAt: Date.now()
+          };
+          try {
+            localStorage.setItem('drainGuardLiveLocation', JSON.stringify(state.liveLocation));
+          } catch (_) {}
+          populateDeviceSelector();
+          updateAdaptiveLocationUI();
+          if (!silent) {
+            showToast(`Approximate location detected: ${label}`, 'info');
+          }
+          return state.liveLocation;
+        }
+      }
+    } catch (_) {
+      if (!silent) {
+        showToast('Enable browser location permission to pin exact GPS coordinates', 'warning');
+      }
+    } finally {
+      state.locationDetecting = false;
+    }
+    return state.liveLocation;
+  }
+
+  /**
+   * Updates Leaflet mini-map & telemetry location text in place when location resolves
+   */
+  function updateAdaptiveLocationUI() {
+    const device = (state.activeOverview && state.activeOverview.device) || {};
+    const eff = getEffectiveLocation(device);
+
+    const locTextEl = document.getElementById('telemetry-location-label');
+    if (locTextEl) {
+      locTextEl.textContent = eff.label;
+    }
+    const coordsEl = document.getElementById('telemetry-coords-pill');
+    if (coordsEl) {
+      coordsEl.textContent = `${eff.isLive ? (eff.source === 'gps' ? '📍 Live GPS' : '🌐 Network') : '📌 Saved'} · ${eff.lat.toFixed(4)}, ${eff.lng.toFixed(4)}`;
+    }
+
+    if (leafletMapInstance && leafletMarkerInstance) {
+      leafletMapInstance.setView([eff.lat, eff.lng], 14, { animate: true });
+      leafletMarkerInstance.setLatLng([eff.lat, eff.lng]);
+      leafletMarkerInstance.setPopupContent(`<b>${escapeHTML(sanitizeDeviceName(device.name, device.id))}</b><br>${escapeHTML(eff.label)}`);
+    }
+  }
+
+  /**
+   * Applies Apple-inspired Black & Yellow chart palette defaults based on current theme
+   */
+  function applyChartDefaults(theme) {
+    if (!window.Chart) return;
+    const isDark = theme === 'dark';
+    Chart.defaults.font.family = '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Plus Jakarta Sans", "Inter", sans-serif';
+    Chart.defaults.color = isDark ? '#b4b4bd' : '#3f3d36';
+    Chart.defaults.borderColor = isDark ? 'rgba(255, 255, 255, 0.08)' : 'rgba(17, 17, 19, 0.09)';
+  }
+
   // ─── 3. Theme & Admin Lock Handlers ────────────────────────────────────────
 
   /**
-   * Initializes light/dark theme preference
+   * Initializes light/dark theme preference (Defaults to flagship Obsidian Black & Yellow)
    */
   function initTheme() {
-    const savedTheme = localStorage.getItem('theme') || localStorage.getItem('drainGuardTheme') || 'light';
+    const hasExplicitV3 = localStorage.getItem('drainGuardThemeV3');
+    const savedTheme = hasExplicitV3
+      ? (localStorage.getItem('theme') || localStorage.getItem('drainGuardTheme') || 'dark')
+      : 'dark';
     applyTheme(savedTheme);
 
     const toggleBtn = document.getElementById('theme-toggle');
     if (toggleBtn) {
       toggleBtn.addEventListener('click', () => {
-        const currentTheme = document.documentElement.getAttribute('data-theme') || 'light';
+        const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
         const newTheme = currentTheme === 'light' ? 'dark' : 'light';
+        localStorage.setItem('drainGuardThemeV3', '1');
         applyTheme(newTheme);
+        // Refresh active charts to adopt new theme tick/grid colors
+        loadActiveTab();
       });
     }
   }
@@ -295,6 +491,7 @@
     document.documentElement.setAttribute('data-theme', theme);
     localStorage.setItem('theme', theme);
     localStorage.setItem('drainGuardTheme', theme);
+    applyChartDefaults(theme);
     const icon = document.getElementById('theme-icon');
     if (icon) {
       icon.textContent = theme === 'dark' ? '🌙' : '☀️';
@@ -488,14 +685,87 @@
     }
   }
 
-  // ─── 5. Initial Data Loading ───────────────────────────────────────────────
+  // ─── 5. Initial Data Loading (Instant Cache + Parallel Fetch) ───────────────
+
+  function populateDeviceSelector() {
+    const select = document.getElementById('device-select');
+    if (!select || !state.devices || state.devices.length === 0) return;
+
+    const effGlobal = state.liveLocation;
+    select.innerHTML = state.devices.map(d => {
+      const cleanName = sanitizeDeviceName(d.name, d.id);
+      const locLabel = (effGlobal && effGlobal.label) ? effGlobal.label : ((!d.location || d.location === 'Chennai') ? 'Field Unit' : d.location);
+      return `<option value="${escapeHTML(d.id)}">${escapeHTML(cleanName)} · ${escapeHTML(locLabel)}</option>`;
+    }).join('');
+
+    if (state.currentDeviceId) {
+      select.value = state.currentDeviceId;
+    }
+  }
 
   async function loadInitialData() {
     const select = document.getElementById('device-select');
+    const savedDeviceId = localStorage.getItem('drainGuardDeviceId') || 'drain-01';
+
+    // 1. Instant Paint from localStorage cache (eliminates startup blank/skeleton delay)
+    let renderedFromCache = false;
     try {
-      showSkeleton('tab-overview', 'Connecting to DrainGuard server...');
-      const devices = await API.getDevices();
-      state.devices = Array.isArray(devices) ? devices : (devices.devices || []);
+      const cachedDevicesRaw = localStorage.getItem('drainGuard_devices_v3');
+      const cachedOverviewRaw = localStorage.getItem(`drainGuard_overview_${savedDeviceId}_v3`);
+      if (cachedDevicesRaw) {
+        const cachedDevices = JSON.parse(cachedDevicesRaw);
+        if (Array.isArray(cachedDevices) && cachedDevices.length > 0) {
+          state.devices = cachedDevices;
+          const found = cachedDevices.find(d => d.id === savedDeviceId);
+          state.currentDeviceId = found ? found.id : cachedDevices[0].id;
+          populateDeviceSelector();
+        }
+      }
+      if (cachedOverviewRaw && state.activeTab === 'overview') {
+        const cachedOverview = JSON.parse(cachedOverviewRaw);
+        if (cachedOverview && cachedOverview.device) {
+          state.activeOverview = cachedOverview;
+          updateHeaderOnlineStatus(cachedOverview.device, cachedOverview.reading);
+          renderOverviewTab(cachedOverview);
+          renderedFromCache = true;
+        }
+      }
+    } catch (_) {}
+
+    if (!renderedFromCache && state.activeTab === 'overview') {
+      showSkeleton('tab-overview', 'Connecting to DrainGuard telemetry...');
+    }
+
+    // Attach device selector change handler once
+    if (select && !select.dataset.bound) {
+      select.dataset.bound = '1';
+      select.addEventListener('change', (e) => {
+        state.currentDeviceId = e.target.value;
+        renderedOverviewDeviceId = null;
+        localStorage.setItem('drainGuardDeviceId', state.currentDeviceId);
+        loadActiveTab();
+      });
+    }
+
+    // Start adaptive device geolocation quietly in background (never blocks telemetry)
+    detectCurrentLocation(true);
+
+    try {
+      // 2. Parallel Startup Fetch: request device list AND target overview simultaneously!
+      const [devicesRes, overviewRes] = await Promise.allSettled([
+        API.getDevices(),
+        state.activeTab === 'overview' ? fetchOverviewData(renderedFromCache, savedDeviceId) : Promise.resolve(null)
+      ]);
+
+      if (devicesRes.status === 'rejected') {
+        throw devicesRes.reason;
+      }
+
+      const rawDevices = devicesRes.value;
+      state.devices = (Array.isArray(rawDevices) ? rawDevices : (rawDevices.devices || [])).map(d => ({
+        ...d,
+        name: sanitizeDeviceName(d.name, d.id)
+      }));
 
       if (state.devices.length === 0) {
         select.innerHTML = '<option value="">No devices registered</option>';
@@ -503,30 +773,26 @@
         return;
       }
 
-      // Populate selector dropdown
-      select.innerHTML = state.devices.map(d => `
-        <option value="${escapeHTML(d.id)}">${escapeHTML(d.name || d.id)} (${escapeHTML(d.location || 'Site')})</option>
-      `).join('');
+      try {
+        localStorage.setItem('drainGuard_devices_v3', JSON.stringify(state.devices));
+      } catch (_) {}
 
-      // Restore saved device or select first
-      const savedDevice = localStorage.getItem('drainGuardDeviceId');
-      const foundSaved = state.devices.find(d => d.id === savedDevice);
-      state.currentDeviceId = foundSaved ? foundSaved.id : state.devices[0].id;
-      select.value = state.currentDeviceId;
+      const foundSaved = state.devices.find(d => d.id === savedDeviceId);
+      const targetId = foundSaved ? foundSaved.id : state.devices[0].id;
+      const switchedId = targetId !== savedDeviceId;
+      state.currentDeviceId = targetId;
 
-      // Handle device changes
-      select.addEventListener('change', (e) => {
-        state.currentDeviceId = e.target.value;
-        localStorage.setItem('drainGuardDeviceId', state.currentDeviceId);
+      populateDeviceSelector();
+
+      // If non-overview tab is active OR initial guess ID differed from resolved ID, load now
+      if (state.activeTab !== 'overview' || switchedId || (overviewRes && overviewRes.status === 'rejected')) {
         loadActiveTab();
-      });
-
-      // Load data for active tab
-      loadActiveTab();
-
+      }
     } catch (err) {
       console.error('[App] Failed to load devices:', err);
-      showError('tab-overview', `Could not reach server: ${err.message}. Ensure backend is running at ${API.getBaseUrl ? API.getBaseUrl() : 'http://localhost:3001'}.`, loadInitialData);
+      if (!renderedFromCache) {
+        showError('tab-overview', `Could not reach server: ${err.message}. Ensure backend is running at ${API.getBaseUrl ? API.getBaseUrl() : 'http://localhost:3001'}.`, loadInitialData);
+      }
     }
   }
 
@@ -559,26 +825,33 @@
 
   /**
    * Fetches latest overview data payload for selected device
-   * @param {boolean} isPolling - If true, avoids rebuilding static containers
+   * @param {boolean} isPolling - If true, updates DOM in-place without rebuilding static containers
+   * @param {string} [overrideDeviceId] - Optional explicit deviceId (used during parallel startup)
    */
-  async function fetchOverviewData(isPolling = false) {
-    if (!state.currentDeviceId) return;
+  async function fetchOverviewData(isPolling = false, overrideDeviceId = null) {
+    const deviceId = overrideDeviceId || state.currentDeviceId;
+    if (!deviceId) return;
 
-    if (!isPolling) {
+    const alreadyRendered = renderedOverviewDeviceId === deviceId && Boolean(document.getElementById('tank-visual-container'));
+    if (!isPolling && !alreadyRendered) {
       showSkeleton('tab-overview', 'Fetching real-time sensor telemetry...');
     }
 
     try {
-      const data = await API.getDeviceOverview(state.currentDeviceId);
+      const data = await API.getDeviceOverview(deviceId);
       hideColdStartMsg();
 
       // Normalize device object
-      const device = data.device || state.devices.find(d => d.id === state.currentDeviceId) || { id: state.currentDeviceId, last_seen: data.last_seen };
+      const baseDevice = data.device || state.devices.find(d => d.id === deviceId) || { id: deviceId, last_seen: data.last_seen };
+      const device = {
+        ...baseDevice,
+        name: sanitizeDeviceName(baseDevice.name, baseDevice.id || deviceId)
+      };
       if (!device.last_seen && data.last_seen) device.last_seen = data.last_seen;
 
       const reading = data.reading || data.latest_reading || {};
       const rodEvent = data.rod_event || data.latest_rod_event || {};
-      const config = data.config || {
+      const config = (data.config && Object.keys(data.config).length > 0) ? data.config : {
         baseline_rod: data.baseline_rod || (rodEvent && rodEvent.baseline_rod) || 0,
         sensor_to_bottom_cm: 60,
         rain_start_cm: 10,
@@ -587,25 +860,22 @@
         offline_after_min: 15
       };
 
-      // If overview doesn't have recent readings, fetch them for the mini chart
-      let recentReadings = data.recent_readings || [];
-      if (!recentReadings || recentReadings.length === 0) {
-        try {
-          const readingsRes = await API.getReadings({ device_id: state.currentDeviceId, pageSize: 30 });
-          recentReadings = Array.isArray(readingsRes) ? readingsRes : (readingsRes.data || readingsRes.readings || []);
-        } catch (e) {
-          console.warn('[Overview] Could not fetch recent readings:', e);
-        }
-      }
+      // Fetch readings & alerts in PARALLEL only if backend didn't already bundle them
+      let recentReadings = Array.isArray(data.recent_readings) ? data.recent_readings : null;
+      let alertsList = Array.isArray(data.alerts) ? data.alerts : (Array.isArray(data.open_alerts) ? data.open_alerts : null);
 
-      // If overview doesn't include alerts array, fetch open alerts
-      let alertsList = data.alerts || data.open_alerts || [];
-      if (!alertsList || alertsList.length === 0) {
-        try {
-          const alertsRes = await API.getAlerts({ device_id: state.currentDeviceId, status: 'open', pageSize: 10 });
-          alertsList = Array.isArray(alertsRes) ? alertsRes : (alertsRes.data || alertsRes.alerts || []);
-        } catch (e) {
-          // ignore
+      if (recentReadings === null || alertsList === null) {
+        const [readingsRes, alertsRes] = await Promise.allSettled([
+          recentReadings === null ? API.getReadings({ device_id: deviceId, pageSize: 30 }) : Promise.resolve(recentReadings),
+          alertsList === null ? API.getAlerts({ device_id: deviceId, status: 'open', pageSize: 10 }) : Promise.resolve(alertsList)
+        ]);
+        if (recentReadings === null) {
+          const rVal = readingsRes.status === 'fulfilled' ? readingsRes.value : [];
+          recentReadings = Array.isArray(rVal) ? rVal : (rVal.data || rVal.readings || []);
+        }
+        if (alertsList === null) {
+          const aVal = alertsRes.status === 'fulfilled' ? alertsRes.value : [];
+          alertsList = Array.isArray(aVal) ? aVal : (aVal.data || aVal.alerts || []);
         }
       }
 
@@ -627,18 +897,25 @@
 
       state.activeOverview = normalizedData;
 
-      // Update online indicator
-      updateHeaderOnlineStatus(device, reading);
+      // Cache for instant startup next time
+      try {
+        localStorage.setItem(`drainGuard_overview_${deviceId}_v3`, JSON.stringify(normalizedData));
+      } catch (_) {}
 
-      // Check critical alerts for banner
+      // Update online indicator & critical alerts banner
+      updateHeaderOnlineStatus(device, reading);
       checkCriticalAlerts(alertsList);
 
-      // Render full overview DOM
-      renderOverviewTab(normalizedData);
+      // Update in place during polling if already rendered for this device (zero flicker!)
+      if (isPolling && renderedOverviewDeviceId === deviceId && document.getElementById('tank-visual-container')) {
+        updateOverviewInPlace(normalizedData);
+      } else {
+        renderOverviewTab(normalizedData);
+      }
 
     } catch (err) {
       console.error('[Overview] Polling error:', err);
-      if (!isPolling) {
+      if (!isPolling && !alreadyRendered) {
         showError('tab-overview', `Telemetry fetch error: ${err.message}`, () => fetchOverviewData());
       }
     }
@@ -721,6 +998,8 @@
     const todayCounters = data.today || {};
     const healthScore = calculateHealthScore(rodEvent, reading);
 
+    renderedOverviewDeviceId = device.id || state.currentDeviceId;
+
     container.innerHTML = `
       <!-- Top Overview Layout: Tank | Status & State | Gauge & Health -->
       <div class="overview-grid-top">
@@ -739,7 +1018,9 @@
         <!-- Column 2: Status Badge & Operational State Stepper -->
         <div style="display: flex; flex-direction: column; gap: 1.25rem;">
           <!-- Primary Status Card -->
-          ${renderStatusCardHTML(rodEvent, reading)}
+          <div id="overview-status-slot">
+            ${renderStatusCardHTML(rodEvent, reading)}
+          </div>
 
           <!-- State Machine Stepper -->
           <div class="card">
@@ -747,19 +1028,21 @@
               <h3 class="card-title"><span>🔄</span> Analysis State Machine</h3>
               <span class="card-subtitle">Real-time Cycle</span>
             </div>
-            ${renderStateStepperHTML(reading.state || 'IDLE')}
+            <div id="overview-stepper-slot">
+              ${renderStateStepperHTML(reading.state || 'IDLE')}
+            </div>
           </div>
 
           <!-- Quick Today Counters -->
           <div class="kpi-grid" style="grid-template-columns: 1fr 1fr; margin-bottom: 0;">
             <div class="kpi-card">
               <span class="kpi-title">Rain Events Today</span>
-              <span class="kpi-value">${todayCounters.rain_events || 0}</span>
+              <span class="kpi-value" id="kpi-rain-today">${todayCounters.rain_events || 0}</span>
               <span class="kpi-subtext">Calculated drop cycles</span>
             </div>
             <div class="kpi-card">
               <span class="kpi-title">Open Alerts</span>
-              <span class="kpi-value" style="color: ${(todayCounters.open_alerts || 0) > 0 ? 'var(--color-preclog)' : 'var(--color-clear)'};">
+              <span class="kpi-value" id="kpi-open-alerts" style="color: ${(todayCounters.open_alerts || 0) > 0 ? 'var(--color-preclog)' : 'var(--color-clear)'};">
                 ${todayCounters.open_alerts || 0}
               </span>
               <span class="kpi-subtext">Actionable warnings</span>
@@ -775,7 +1058,9 @@
               <h3 class="card-title"><span>⏱️</span> Rate of Drop (ROD)</h3>
               <span class="card-subtitle">Drainage Velocity</span>
             </div>
-            ${renderRodGaugeHTML(rodEvent)}
+            <div id="overview-gauge-slot">
+              ${renderRodGaugeHTML(rodEvent)}
+            </div>
           </div>
 
           <!-- Health Score Card -->
@@ -784,7 +1069,9 @@
               <h3 class="card-title"><span>❤️</span> Drain Health Score</h3>
               <span class="card-subtitle">Predictive Index</span>
             </div>
-            ${renderHealthScoreHTML(healthScore)}
+            <div id="overview-health-slot">
+              ${renderHealthScoreHTML(healthScore)}
+            </div>
           </div>
         </div>
 
@@ -808,19 +1095,99 @@
         <div class="card">
           <div class="card-header">
             <h3 class="card-title"><span>📡</span> Device Telemetry</h3>
-            <span class="card-subtitle">Field Hardware Status</span>
+            <button id="btn-sync-live-location" class="btn btn-secondary btn-sm" title="Detect current GPS location of this unit">
+              📍 Detect GPS
+            </button>
           </div>
-          ${renderDeviceInfoHTML(device, reading)}
+          <div id="overview-device-slot">
+            ${renderDeviceInfoHTML(device, reading)}
+          </div>
         </div>
 
       </div>
     `;
+
+    // Bind live GPS sync button
+    const syncLocBtn = document.getElementById('btn-sync-live-location');
+    if (syncLocBtn) {
+      syncLocBtn.addEventListener('click', () => detectCurrentLocation(false));
+    }
 
     // Initialize the live water line chart
     initLiveWaterChart(recentReadings, config);
 
     // Initialize or refresh Leaflet mini map
     initDeviceMiniMap(device);
+  }
+
+  /**
+   * Updates Overview cards & Chart.js in-place during 5s polling (zero flicker, preserves map)
+   */
+  function updateOverviewInPlace(data) {
+    const device = data.device || {};
+    const reading = data.reading || {};
+    const rodEvent = data.rod_event || {};
+    const config = data.config || {};
+    const recentReadings = data.recent_readings || [];
+    const todayCounters = data.today || {};
+    const healthScore = calculateHealthScore(rodEvent, reading);
+
+    const tankEl = document.getElementById('tank-visual-container');
+    if (tankEl) tankEl.innerHTML = renderDrainTankHTML(reading, config);
+
+    const statusEl = document.getElementById('overview-status-slot');
+    if (statusEl) statusEl.innerHTML = renderStatusCardHTML(rodEvent, reading);
+
+    const stepperEl = document.getElementById('overview-stepper-slot');
+    if (stepperEl) stepperEl.innerHTML = renderStateStepperHTML(reading.state || 'IDLE');
+
+    const rainEl = document.getElementById('kpi-rain-today');
+    if (rainEl) rainEl.textContent = todayCounters.rain_events || 0;
+
+    const alertEl = document.getElementById('kpi-open-alerts');
+    if (alertEl) {
+      const count = todayCounters.open_alerts || 0;
+      alertEl.textContent = count;
+      alertEl.style.color = count > 0 ? 'var(--color-preclog)' : 'var(--color-clear)';
+    }
+
+    const gaugeEl = document.getElementById('overview-gauge-slot');
+    if (gaugeEl) gaugeEl.innerHTML = renderRodGaugeHTML(rodEvent);
+
+    const healthEl = document.getElementById('overview-health-slot');
+    if (healthEl) healthEl.innerHTML = renderHealthScoreHTML(healthScore);
+
+    // Update Device Telemetry text values WITHOUT destroying #device-mini-map
+    const barsCount = rssiToBars(reading && reading.rssi);
+    const rssiTextEl = document.getElementById('telemetry-rssi-val');
+    if (rssiTextEl) rssiTextEl.textContent = reading && reading.rssi !== undefined ? `${reading.rssi} dBm` : '--';
+    const barsEl = document.getElementById('telemetry-signal-bars');
+    if (barsEl) {
+      barsEl.querySelectorAll('.bar').forEach((bar, i) => {
+        bar.classList.toggle('active', barsCount >= i + 1);
+      });
+    }
+    const uptimeEl = document.getElementById('telemetry-uptime-val');
+    if (uptimeEl) uptimeEl.textContent = formatUptime(reading && reading.uptime_s);
+    const lastSeenEl = document.getElementById('telemetry-lastseen-val');
+    if (lastSeenEl) lastSeenEl.textContent = formatIST((device && device.last_seen) || (reading && reading.created_at));
+
+    // Update live water chart smoothly without destroying canvas
+    if (chartRegistry['liveWater']) {
+      const sorted = [...(recentReadings || [])].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+      const labels = sorted.map(r => formatShortIST(r.created_at));
+      const dataPoints = sorted.map(r => r.water_cm !== undefined ? r.water_cm : 0);
+      const rainThreshold = (config && config.rain_start_cm) || 10;
+
+      const chart = chartRegistry['liveWater'];
+      chart.data.labels = labels.length > 0 ? labels : ['Now'];
+      chart.data.datasets[0].data = dataPoints.length > 0 ? dataPoints : [0];
+      chart.data.datasets[0].pointRadius = dataPoints.length > 20 ? 1 : 3;
+      chart.data.datasets[1].data = chart.data.labels.map(() => rainThreshold);
+      chart.update('none');
+    } else {
+      initLiveWaterChart(recentReadings, config);
+    }
   }
 
   /**
@@ -1111,6 +1478,10 @@
     const rainThreshold = (config && config.rain_start_cm) || 10;
 
     const ctx = canvas.getContext('2d');
+    const gradient = ctx.createLinearGradient(0, 0, 0, 260);
+    gradient.addColorStop(0, 'rgba(56, 189, 248, 0.35)');
+    gradient.addColorStop(1, 'rgba(56, 189, 248, 0.02)');
+
     chartRegistry['liveWater'] = new Chart(ctx, {
       type: 'line',
       data: {
@@ -1119,18 +1490,18 @@
           {
             label: 'Water Depth (cm)',
             data: dataPoints.length > 0 ? dataPoints : [0],
-            borderColor: '#0284c7',
-            backgroundColor: 'rgba(2, 132, 199, 0.15)',
+            borderColor: '#38bdf8',
+            backgroundColor: gradient,
             fill: true,
-            tension: 0.35,
+            tension: 0.38,
             borderWidth: 2.5,
-            pointRadius: dataPoints.length > 20 ? 1 : 3,
-            pointBackgroundColor: '#0284c7'
+            pointRadius: dataPoints.length > 20 ? 1.5 : 3.5,
+            pointBackgroundColor: '#38bdf8'
           },
           {
             label: 'Rain Start Threshold',
             data: labels.map(() => rainThreshold),
-            borderColor: '#f59e0b',
+            borderColor: '#ffd60a',
             borderDash: [5, 5],
             borderWidth: 1.5,
             fill: false,
@@ -1156,7 +1527,7 @@
           y: {
             beginAtZero: true,
             title: { display: true, text: 'Depth (cm)', font: { size: 11 } },
-            grid: { color: 'rgba(150, 150, 150, 0.15)' }
+            grid: { color: 'rgba(150, 150, 160, 0.12)' }
           },
           x: {
             title: { display: true, text: 'Time (IST)', font: { size: 11 } },
@@ -1175,38 +1546,44 @@
     const rssiVal = reading && reading.rssi !== undefined ? `${reading.rssi} dBm` : '--';
     const uptime = formatUptime(reading && reading.uptime_s);
     const lastSeen = formatIST((device && device.last_seen) || (reading && reading.created_at));
+    const effLoc = getEffectiveLocation(device);
 
     return `
       <div>
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; margin-bottom: 0.75rem; font-size: 0.85rem;">
           <div>
-            <div style="color: var(--text-muted); font-size: 0.75rem;">Device ID</div>
+            <div style="color: var(--text-muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em;">Unit ID</div>
             <div style="font-weight: 700; font-family: var(--font-mono);">${escapeHTML(device.id || '--')}</div>
           </div>
           <div>
-            <div style="color: var(--text-muted); font-size: 0.75rem;">Installation Location</div>
-            <div style="font-weight: 700;">${escapeHTML(device.location || 'Chennai Ward')}</div>
+            <div style="color: var(--text-muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em;">Current Location</div>
+            <div id="telemetry-location-label" style="font-weight: 700;">${escapeHTML(effLoc.label)}</div>
           </div>
           <div>
-            <div style="color: var(--text-muted); font-size: 0.75rem;">Wi-Fi Signal</div>
+            <div style="color: var(--text-muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em;">Wi-Fi Signal</div>
             <div style="display: flex; align-items: center; gap: 0.4rem; font-weight: 600;">
-              <span class="signal-bars">
+              <span id="telemetry-signal-bars" class="signal-bars">
                 <span class="bar ${barsCount >= 1 ? 'active' : ''}"></span>
                 <span class="bar ${barsCount >= 2 ? 'active' : ''}"></span>
                 <span class="bar ${barsCount >= 3 ? 'active' : ''}"></span>
                 <span class="bar ${barsCount >= 4 ? 'active' : ''}"></span>
               </span>
-              <span>${rssiVal}</span>
+              <span id="telemetry-rssi-val">${rssiVal}</span>
             </div>
           </div>
           <div>
-            <div style="color: var(--text-muted); font-size: 0.75rem;">System Uptime</div>
-            <div style="font-weight: 700;">${uptime}</div>
+            <div style="color: var(--text-muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em;">System Uptime</div>
+            <div id="telemetry-uptime-val" style="font-weight: 700;">${uptime}</div>
           </div>
         </div>
 
-        <div style="font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 0.5rem;">
-          <strong>Last Telemetry:</strong> ${lastSeen}
+        <div class="location-badge-row">
+          <div style="font-size: 0.78rem; color: var(--text-secondary);">
+            <strong>Last Telemetry:</strong> <span id="telemetry-lastseen-val">${lastSeen}</span>
+          </div>
+          <span id="telemetry-coords-pill" class="gps-pill">
+            ${effLoc.isLive ? (effLoc.source === 'gps' ? '📍 Live GPS' : '🌐 Network') : '📌 Saved'} · ${effLoc.lat.toFixed(4)}, ${effLoc.lng.toFixed(4)}
+          </span>
         </div>
 
         <!-- Embedded Mini Leaflet Map -->
@@ -1216,23 +1593,23 @@
   }
 
   /**
-   * Initializes or updates the mini Leaflet map for device GPS coordinates
+   * Initializes or updates the mini Leaflet map for adaptive device GPS coordinates
    */
   function initDeviceMiniMap(device) {
     const mapEl = document.getElementById('device-mini-map');
     if (!mapEl || !window.L) return;
 
-    const lat = device && device.lat ? Number(device.lat) : 13.0827; // Default Chennai coordinates
-    const lng = device && device.lng ? Number(device.lng) : 80.2707;
+    const eff = getEffectiveLocation(device);
 
     try {
       if (leafletMapInstance) {
         leafletMapInstance.remove();
         leafletMapInstance = null;
+        leafletMarkerInstance = null;
       }
 
       leafletMapInstance = L.map(mapEl, {
-        center: [lat, lng],
+        center: [eff.lat, eff.lng],
         zoom: 14,
         zoomControl: false,
         attributionControl: false
@@ -1242,9 +1619,9 @@
         maxZoom: 18
       }).addTo(leafletMapInstance);
 
-      L.marker([lat, lng])
+      leafletMarkerInstance = L.marker([eff.lat, eff.lng])
         .addTo(leafletMapInstance)
-        .bindPopup(`<b>${escapeHTML(device.name || device.id)}</b><br>${escapeHTML(device.location || 'Drain Unit')}`);
+        .bindPopup(`<b>${escapeHTML(sanitizeDeviceName(device.name, device.id))}</b><br>${escapeHTML(eff.label)}`);
 
       // Fix render size if container was hidden initially
       setTimeout(() => {
@@ -1584,9 +1961,11 @@
         datasets: [{
           label: 'Events (H1 vs RoD)',
           data: points,
-          backgroundColor: '#0284c7',
-          pointRadius: 5,
-          pointHoverRadius: 7
+          backgroundColor: '#ffd60a',
+          borderColor: '#050507',
+          borderWidth: 1,
+          pointRadius: 6,
+          pointHoverRadius: 8
         }]
       },
       options: {
@@ -1629,8 +2008,8 @@
         datasets: [{
           label: 'Rainfall Cycles Count',
           data: counts.length > 0 ? counts : [0],
-          backgroundColor: '#6366f1',
-          borderRadius: 4
+          backgroundColor: '#ffd60a',
+          borderRadius: 6
         }]
       },
       options: {
@@ -1786,16 +2165,16 @@
           {
             label: 'Water Depth (cm)',
             data: values.length > 0 ? values : [0],
-            borderColor: '#0284c7',
-            backgroundColor: 'rgba(2, 132, 199, 0.1)',
+            borderColor: '#38bdf8',
+            backgroundColor: 'rgba(56, 189, 248, 0.14)',
             fill: true,
-            tension: 0.2,
-            borderWidth: 2
+            tension: 0.3,
+            borderWidth: 2.2
           },
           {
             label: 'Rain Start Threshold',
             data: labels.map(() => rainThreshold),
-            borderColor: '#f59e0b',
+            borderColor: '#ffd60a',
             borderDash: [5, 5],
             borderWidth: 1.5,
             pointRadius: 0,
@@ -2343,10 +2722,10 @@
             datasets: [{
               label: 'Water (cm)',
               data: points.length > 0 ? points : [Number(eventItem.h1_cm) || 0],
-              borderColor: '#0284c7',
-              backgroundColor: 'rgba(2, 132, 199, 0.1)',
+              borderColor: '#ffd60a',
+              backgroundColor: 'rgba(255, 214, 10, 0.12)',
               fill: true,
-              tension: 0.2
+              tension: 0.25
             }]
           },
           options: {
@@ -2570,22 +2949,27 @@
               <!-- Device Name & Location -->
               <div class="form-group">
                 <label class="form-label" for="setting-name">Friendly Name</label>
-                <input type="text" id="setting-name" class="form-control" value="${escapeHTML(device.name || '')}" ${!isAdmin ? 'disabled' : ''}>
+                <input type="text" id="setting-name" class="form-control" value="${escapeHTML(sanitizeDeviceName(device.name, device.id || state.currentDeviceId))}" ${!isAdmin ? 'disabled' : ''}>
               </div>
 
               <div class="form-group">
-                <label class="form-label" for="setting-location">Installation Location</label>
-                <input type="text" id="setting-location" class="form-control" value="${escapeHTML(device.location || '')}" ${!isAdmin ? 'disabled' : ''}>
+                <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.35rem;">
+                  <label class="form-label" for="setting-location" style="margin-bottom: 0;">Installation Location</label>
+                  <button type="button" id="btn-fill-current-location" class="btn btn-secondary btn-sm" ${!isAdmin ? 'disabled' : ''}>
+                    📍 Use Current GPS
+                  </button>
+                </div>
+                <input type="text" id="setting-location" class="form-control" value="${escapeHTML(getEffectiveLocation(device).label)}" ${!isAdmin ? 'disabled' : ''}>
               </div>
 
               <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem;">
                 <div class="form-group">
                   <label class="form-label" for="setting-lat">Latitude</label>
-                  <input type="number" step="0.0001" id="setting-lat" class="form-control" value="${device.lat || ''}" ${!isAdmin ? 'disabled' : ''}>
+                  <input type="number" step="0.0001" id="setting-lat" class="form-control" value="${getEffectiveLocation(device).lat.toFixed(4)}" ${!isAdmin ? 'disabled' : ''}>
                 </div>
                 <div class="form-group">
                   <label class="form-label" for="setting-lng">Longitude</label>
-                  <input type="number" step="0.0001" id="setting-lng" class="form-control" value="${device.lng || ''}" ${!isAdmin ? 'disabled' : ''}>
+                  <input type="number" step="0.0001" id="setting-lng" class="form-control" value="${getEffectiveLocation(device).lng.toFixed(4)}" ${!isAdmin ? 'disabled' : ''}>
                 </div>
               </div>
 
@@ -2696,6 +3080,26 @@
         unlockBtn.addEventListener('click', () => {
           const modal = document.getElementById('admin-modal');
           if (modal) modal.hidden = false;
+        });
+      }
+
+      // Fill Current GPS Location button
+      const fillLocBtn = document.getElementById('btn-fill-current-location');
+      if (fillLocBtn) {
+        fillLocBtn.addEventListener('click', async () => {
+          fillLocBtn.disabled = true;
+          fillLocBtn.textContent = 'Detecting...';
+          const loc = await detectCurrentLocation(false);
+          if (loc) {
+            const locInput = document.getElementById('setting-location');
+            const latInput = document.getElementById('setting-lat');
+            const lngInput = document.getElementById('setting-lng');
+            if (locInput) locInput.value = loc.label;
+            if (latInput) latInput.value = loc.lat.toFixed(4);
+            if (lngInput) lngInput.value = loc.lng.toFixed(4);
+          }
+          fillLocBtn.disabled = false;
+          fillLocBtn.textContent = '📍 Use Current GPS';
         });
       }
 

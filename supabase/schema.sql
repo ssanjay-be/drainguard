@@ -223,18 +223,18 @@ ALTER TABLE device_config ENABLE ROW LEVEL SECURITY;
 -- ON CONFLICT DO NOTHING makes this re-runnable without errors.
 -- =============================================================================
 
--- Demo device: a mock PVC-pipe drain unit in Chennai, India
+-- Primary field unit: stormwater drain monitoring node
 INSERT INTO devices (id, name, location, lat, lng)
 VALUES (
     'drain-01',
-    'Demo Drain - Mock PVC',
-    'Chennai',
+    'DrainGuard Unit 01',
+    'Active Field Site',
     13.0827,
     80.2707
 )
 ON CONFLICT (id) DO NOTHING;
 
--- Default configuration for the demo device
+-- Default configuration for the primary unit
 INSERT INTO device_config (device_id)
 VALUES ('drain-01')
 ON CONFLICT (device_id) DO NOTHING;
