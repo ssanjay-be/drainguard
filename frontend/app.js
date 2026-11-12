@@ -49,6 +49,7 @@
     historyStatusFilter: '',
     analyticsDays: 30,
     trendsRange: '24h',
+    trendsUserPicked: false,
     calibrationPollingId: null
   };
 
@@ -2924,11 +2925,23 @@
     if (!container) return;
 
     const deviceId = state.currentDeviceId;
-    const range = state.trendsRange;
-    const cacheKey = `${deviceId}_${range}`;
+
+    // Auto-select a range that covers the device's latest telemetry on initial visit
+    if (!state.trendsUserPicked && state.activeOverview && state.activeOverview.device && state.activeOverview.device.id === deviceId) {
+      const latestIso = (state.activeOverview.reading && state.activeOverview.reading.created_at) || state.activeOverview.device.last_seen;
+      if (latestIso) {
+        const ageMs = Date.now() - new Date(latestIso).getTime();
+        if (ageMs > 30 * 24 * 60 * 60 * 1000) state.trendsRange = '90d';
+        else if (ageMs > 6.5 * 24 * 60 * 60 * 1000) state.trendsRange = '30d';
+        else if (ageMs > 23 * 60 * 60 * 1000) state.trendsRange = '7d';
+      }
+    }
+
+    let range = state.trendsRange;
+    let cacheKey = `${deviceId}_${range}`;
     const cached = tabCache.trends[cacheKey];
 
-    const paintTrends = ({ trend, configData, readingsRes, fromDate, rangeCfg }) => {
+    const paintTrends = ({ trend, configData, readingsRes, fromDate, rangeCfg, activeRange }) => {
       const config = (configData && configData.config) || {};
       const fromMs = new Date(fromDate).getTime();
 
@@ -2953,7 +2966,10 @@
           .sort((a, b) => new Date(a.time) - new Date(b.time))
         : [];
 
-      const waterSeries = normalizedFetched.length >= 2 ? normalizedFetched : (backendSeries.length > 0 ? backendSeries : normalizedFetched);
+      // Prefer full-resolution 120-pt backendSeries when coarse daily/hourly bucketing collapses bursts into < 5 points
+      const waterSeries = normalizedFetched.length >= 5
+        ? normalizedFetched
+        : (backendSeries.length > normalizedFetched.length ? backendSeries : normalizedFetched);
 
       const allTrendPoints = trend.events || trend.points || [];
       const points = allTrendPoints.filter(p => !p.created_at || new Date(p.created_at).getTime() >= fromMs);
@@ -2993,32 +3009,37 @@
             : (latestRate <= -0.25
               ? `actively draining (${latestRate.toFixed(2)} cm/min)`
               : 'currently steady');
-          insightText = `Analyzed ${waterSeries.length} points in the ${range} window: depth is ${latestWater.toFixed(1)} cm (${directionStr}; mean ${avgWater.toFixed(1)} cm, peak ${peakWater.toFixed(1)} cm, net shift ${netShift >= 0 ? '+' : ''}${netShift.toFixed(1)} cm). Linear RoD degradation regression unlocks after 2+ full drain drop cycles.`;
+          insightText = `Analyzed ${waterSeries.length} points in the ${activeRange} window: depth is ${latestWater.toFixed(1)} cm (${directionStr}; mean ${avgWater.toFixed(1)} cm, peak ${peakWater.toFixed(1)} cm, net shift ${netShift >= 0 ? '+' : ''}${netShift.toFixed(1)} cm). Linear RoD degradation regression unlocks after 2+ full drain drop cycles.`;
         } else {
-          insightText = `Awaiting more telemetry packets in the ${range} window. Try switching to 24h or 7d if no readings arrived in the last hour.`;
+          const lastSeenHint = state.activeOverview && state.activeOverview.device && state.activeOverview.device.last_seen
+            ? ` (latest packet was ${formatShortIST(state.activeOverview.device.last_seen)})`
+            : '';
+          insightText = `No telemetry packets recorded inside the ${activeRange} window${lastSeenHint}. Switch to 30d or 90d to inspect historical cycles.`;
         }
       }
 
       const isDeclining = (trend.slope_per_week !== null && trend.slope_per_week !== undefined && trend.slope_per_week < 0) || (trend.insight && trend.insight.status === 'declining') || (latestRate >= 0.5 && latestWater >= (Number(config.rain_start_cm) || 10));
       const projectedDays = trend.projected_days_until_preclog || (trend.insight && trend.insight.projected_days);
       const hasRegressionPoints = points && points.length >= 2;
+      const showEmptyCta = waterSeries.length === 0 && activeRange !== '30d' && activeRange !== '90d';
 
       container.innerHTML = `
         <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.25rem;">
           <div>
             <div style="display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;">
               <h2 style="font-size: 1.3rem; font-weight: 800;">Degradation &amp; Velocity Trends</h2>
-              <span class="badge badge-info" style="font-size: 0.72rem;">📡 Live 10s Sync (${escapeHTML(range)})</span>
+              <span class="badge badge-info" style="font-size: 0.72rem;">📡 Live 10s Sync (${escapeHTML(activeRange)})</span>
             </div>
             <p style="font-size: 0.85rem; color: var(--text-secondary);">Predictive linear regression, live dH/dt flow velocity &amp; clogging projection models</p>
           </div>
 
           <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
-            <button class="btn ${range === '1h' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="1h">1h</button>
-            <button class="btn ${range === '6h' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="6h">6h</button>
-            <button class="btn ${range === '24h' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="24h">24h</button>
-            <button class="btn ${range === '7d' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="7d">7d</button>
-            <button class="btn ${range === '30d' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="30d">30d</button>
+            <button class="btn ${activeRange === '1h' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="1h">1h</button>
+            <button class="btn ${activeRange === '6h' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="6h">6h</button>
+            <button class="btn ${activeRange === '24h' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="24h">24h</button>
+            <button class="btn ${activeRange === '7d' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="7d">7d</button>
+            <button class="btn ${activeRange === '30d' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="30d">30d</button>
+            <button class="btn ${activeRange === '90d' ? 'btn-primary' : 'btn-secondary'} btn-sm trends-range-btn" data-range="90d">90d</button>
           </div>
         </div>
 
@@ -3028,15 +3049,21 @@
             <div style="flex: 1; min-width: 240px;">
               <h4 style="font-size: 1rem; margin-bottom: 0.25rem;">Predictive Maintenance Diagnostic</h4>
               <p style="font-size: 0.85rem; color: var(--text-secondary); line-height: 1.45;">${escapeHTML(insightText)}</p>
-              <div style="display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.65rem;">
-                <span class="badge badge-info">📡 ${readingCount} Points (${escapeHTML(range)})</span>
-                <span class="badge clear">Latest: ${latestWater.toFixed(1)} cm</span>
-                <span class="badge clear">Mean: ${avgWater.toFixed(1)} cm</span>
-                <span class="badge ${peakWater >= (Number(config.rain_start_cm) || 10) ? 'watch' : 'clear'}">Peak: ${peakWater.toFixed(1)} cm</span>
-                <span class="badge ${latestRate > 0.25 ? 'watch' : (latestRate < -0.25 ? 'clear' : 'calibrated')}">Flow dH/dt: ${latestRate >= 0 ? '+' : ''}${latestRate.toFixed(2)} cm/min</span>
-                ${hasRegressionPoints && trend.slope_per_week !== null && trend.slope_per_week !== undefined ? `<span class="badge ${trend.slope_per_week < 0 ? 'watch' : 'clear'}">Slope: ${trend.slope_per_week > 0 ? '+' : ''}${Number(trend.slope_per_week).toFixed(3)}/wk</span>` : ''}
-                ${hasRegressionPoints && trend.r_squared !== null && trend.r_squared !== undefined ? `<span class="badge calibrated">R²: ${Number(trend.r_squared).toFixed(2)}</span>` : ''}
-              </div>
+              ${showEmptyCta ? `
+                <div style="margin-top: 0.65rem;">
+                  <button id="btn-trends-jump-30d" class="btn btn-primary btn-sm">📅 Jump to Latest Telemetry (30d)</button>
+                </div>
+              ` : `
+                <div style="display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.65rem;">
+                  <span class="badge badge-info">📡 ${readingCount} Points (${escapeHTML(activeRange)})</span>
+                  <span class="badge clear">Latest: ${latestWater.toFixed(1)} cm</span>
+                  <span class="badge clear">Mean: ${avgWater.toFixed(1)} cm</span>
+                  <span class="badge ${peakWater >= (Number(config.rain_start_cm) || 10) ? 'watch' : 'clear'}">Peak: ${peakWater.toFixed(1)} cm</span>
+                  <span class="badge ${latestRate > 0.25 ? 'watch' : (latestRate < -0.25 ? 'clear' : 'calibrated')}">Flow dH/dt: ${latestRate >= 0 ? '+' : ''}${latestRate.toFixed(2)} cm/min</span>
+                  ${hasRegressionPoints && trend.slope_per_week !== null && trend.slope_per_week !== undefined ? `<span class="badge ${trend.slope_per_week < 0 ? 'watch' : 'clear'}">Slope: ${trend.slope_per_week > 0 ? '+' : ''}${Number(trend.slope_per_week).toFixed(3)}/wk</span>` : ''}
+                  ${hasRegressionPoints && trend.r_squared !== null && trend.r_squared !== undefined ? `<span class="badge calibrated">R²: ${Number(trend.r_squared).toFixed(2)}</span>` : ''}
+                </div>
+              `}
               ${projectedDays ? `
                 <div style="margin-top: 0.5rem; font-size: 0.8rem; font-weight: 700; color: var(--color-watch);">
                   ⏳ Projected time to blockage threshold: ~${projectedDays} days under forecasted precipitation
@@ -3048,7 +3075,7 @@
 
         <div class="card" style="margin-bottom: 1.25rem;">
           <div class="card-header">
-            <h3 class="card-title"><span>🌊</span> Water Level Profile with Rain Threshold (${escapeHTML(range)})</h3>
+            <h3 class="card-title"><span>🌊</span> Water Level Profile with Rain Threshold (${escapeHTML(activeRange)})</h3>
             <span class="card-subtitle">${rangeCfg.bucket === 'raw' ? 'Full-Resolution Telemetry' : `Bucketed (${rangeCfg.bucket}) Time-Series`}</span>
           </div>
           <div class="chart-container">
@@ -3069,10 +3096,20 @@
 
       document.querySelectorAll('.trends-range-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
+          state.trendsUserPicked = true;
           state.trendsRange = e.target.getAttribute('data-range') || '24h';
           renderTrendsTab(false);
         });
       });
+
+      const jumpBtn = document.getElementById('btn-trends-jump-30d');
+      if (jumpBtn) {
+        jumpBtn.addEventListener('click', () => {
+          state.trendsUserPicked = true;
+          state.trendsRange = '30d';
+          renderTrendsTab(false);
+        });
+      }
 
       initTrendsWaterChart(waterSeries, config);
       initTrendsRatioChart(points, trend, waterSeries, config, velocitySeries);
@@ -3088,23 +3125,41 @@
     }
 
     try {
-      const rangeCfg = getTrendRangeConfig(range);
-      const fromDate = new Date(Date.now() - rangeCfg.ms).toISOString();
-      const hasWarmConfig = state.activeOverview && state.activeOverview.device && state.activeOverview.device.id === deviceId && state.activeOverview.config;
+      const fetchForRange = async (targetRange) => {
+        const rangeCfg = getTrendRangeConfig(targetRange);
+        const fromDate = new Date(Date.now() - rangeCfg.ms).toISOString();
+        const hasWarmConfig = state.activeOverview && state.activeOverview.device && state.activeOverview.device.id === deviceId && state.activeOverview.config;
 
-      const [trendData, configData, readingsRes] = await Promise.all([
-        API.getAnalyticsTrend(deviceId, rangeCfg.days),
-        hasWarmConfig ? Promise.resolve(state.activeOverview) : API.getDeviceOverview(deviceId),
-        API.getReadings({
-          device_id: deviceId,
-          from: fromDate,
-          bucket: rangeCfg.bucket,
-          pageSize: 300,
-          limit: 300
-        }).catch(() => ({ data: [] }))
-      ]);
+        const [trendData, configData, readingsRes] = await Promise.all([
+          API.getAnalyticsTrend(deviceId, rangeCfg.days),
+          hasWarmConfig ? Promise.resolve(state.activeOverview) : API.getDeviceOverview(deviceId),
+          API.getReadings({
+            device_id: deviceId,
+            from: fromDate,
+            bucket: rangeCfg.bucket,
+            pageSize: 300,
+            limit: 300
+          }).catch(() => ({ data: [] }))
+        ]);
+        return { trend: trendData || {}, configData, readingsRes, fromDate, rangeCfg, activeRange: targetRange };
+      };
 
-      const payload = { trend: trendData || {}, configData, readingsRes, fromDate, rangeCfg };
+      let payload = await fetchForRange(range);
+
+      // If auto-selected initial range had zero readings, smoothly escalate to 30d/90d
+      if (!state.trendsUserPicked && (!payload.trend.reading_count || payload.trend.reading_count === 0) && range !== '30d' && range !== '90d') {
+        range = '30d';
+        state.trendsRange = '30d';
+        cacheKey = `${deviceId}_30d`;
+        payload = await fetchForRange('30d');
+        if (!payload.trend.reading_count || payload.trend.reading_count === 0) {
+          range = '90d';
+          state.trendsRange = '90d';
+          cacheKey = `${deviceId}_90d`;
+          payload = await fetchForRange('90d');
+        }
+      }
+
       tabCache.trends[cacheKey] = { payload, ts: Date.now() };
       if (state.activeTab === 'trends' && state.currentDeviceId === deviceId && state.trendsRange === range) {
         paintTrends(payload);
@@ -3122,6 +3177,7 @@
     if (range === '6h') return { days: 1, ms: 6 * 60 * 60 * 1000, bucket: '5m' };
     if (range === '24h') return { days: 1, ms: 24 * 60 * 60 * 1000, bucket: '15m' };
     if (range === '7d') return { days: 7, ms: 7 * 24 * 60 * 60 * 1000, bucket: '1h' };
+    if (range === '90d') return { days: 90, ms: 90 * 24 * 60 * 60 * 1000, bucket: '1d' };
     return { days: 30, ms: 30 * 24 * 60 * 60 * 1000, bucket: '1d' };
   }
 
@@ -3274,7 +3330,7 @@
           responsive: true,
           maintainAspectRatio: false,
           scales: {
-            y: { min: 0, max: 1.5, title: { display: true, text: 'ROD Ratio vs Baseline' } }
+            y: { min: 0, suggestedMax: 1.5, title: { display: true, text: 'ROD Ratio vs Baseline' } }
           }
         }
       });
