@@ -445,6 +445,15 @@ button, input, select, textarea {
   background: #fef2f2;
   color: #991b1b;
 }
+.alert-banner-btn-reset {
+  background: rgba(255, 214, 10, 0.25);
+  color: #ffd60a;
+  border-color: rgba(255, 214, 10, 0.6);
+}
+.alert-banner-btn-reset:hover {
+  background: #ffd60a;
+  color: #050507;
+}
 
 /* ─── 5. Cold-Start Server Wakeup Banner ────────────────────── */
 #cold-start-msg {

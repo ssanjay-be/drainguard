@@ -760,6 +760,36 @@
     }
   }
 
+  /**
+   * Resets alert acknowledgement state:
+   * Clears local acknowledgement records and immediately re-triggers the alarm sequence
+   */
+  function resetAlertAcknowledgement(specificAlertId = null) {
+    if (specificAlertId) {
+      delete state.acknowledgedAlertMap[String(specificAlertId)];
+    } else {
+      state.acknowledgedAlertMap = {};
+    }
+    try {
+      localStorage.setItem('drainGuard_acked_alerts', JSON.stringify(state.acknowledgedAlertMap));
+    } catch (_) {}
+
+    showToast('Alarm silence reset — audible monitoring re-armed', 'info', 3000);
+
+    // Refresh active alert check and trigger alarm immediately
+    if (state.currentActiveCriticalAlert) {
+      startSirenLoop('critical');
+    }
+
+    if (state.currentDeviceId) {
+      API.getAlerts({ device_id: state.currentDeviceId, pageSize: 50 }).then(res => {
+        const list = Array.isArray(res) ? res : (res.data || res.alerts || []);
+        checkCriticalAlerts(list);
+        if (state.activeTab === 'alerts') renderAlertsTab();
+      }).catch(() => {});
+    }
+  }
+
   function initSoundAlertControls() {
     const soundBtn = document.getElementById('sound-alerts-btn');
     const soundIcon = document.getElementById('sound-alerts-icon');
@@ -791,7 +821,7 @@
 
         if (state.soundAlertsEnabled) {
           getAudioContext(); // prime audio context on user gesture
-          playIndustrialAlarmBeep(350, 'info'); // feedback beep
+          playIndustrialAlarmBeep('info'); // feedback beep
           showToast('Audible sound alerts enabled', 'success');
           // If critical alert is currently active and unacknowledged, start siren
           if (state.currentActiveCriticalAlert) {
@@ -813,6 +843,14 @@
         } else {
           stopSirenLoop();
         }
+      });
+    }
+
+    // Attach Reset Alarm button handler on the critical banner
+    const resetBtn = document.getElementById('alert-banner-reset');
+    if (resetBtn) {
+      resetBtn.addEventListener('click', () => {
+        resetAlertAcknowledgement();
       });
     }
 
@@ -1414,13 +1452,16 @@
       if (banner) banner.hidden = true;
     }
 
-    // Check for newly arrived alerts and show toast + optional prompt beep
+    // Check for newly arrived alerts: ALWAYS beep on any new incoming alert!
     alertsList.forEach(a => {
       if (a.id && !state.knownAlertIds.has(a.id)) {
         state.knownAlertIds.add(a.id);
         if (a.status === 'open') {
+          // If a new alert is created, clear any prior silencing for this alert ID so it sounds immediately
+          delete state.acknowledgedAlertMap[String(a.id)];
           showToast(`🔔 New ${a.severity.toUpperCase()} alert: ${a.message}`, a.severity === 'critical' ? 'error' : 'warning');
           if (a.severity === 'critical') {
+            stopSirenLoop(); // interrupt any previous state to fire fresh 10s cycle
             startSirenLoop('critical');
           } else if (a.severity === 'warning') {
             playIndustrialAlarmBeep('warning');
@@ -4460,6 +4501,7 @@
       }
 
       const canAct = Boolean(state.adminKey);
+      const isLocallyAcked = Boolean(state.acknowledgedAlertMap[String(a.id)]);
 
       return `
         <div class="alert-item ${sevClass}" data-alert-id="${escapeHTML(a.id)}">
@@ -4473,6 +4515,7 @@
                 <span><strong>Type:</strong> ${escapeHTML(a.type)}</span>
                 <span>•</span>
                 <span>${formatIST(a.created_at)}</span>
+                ${isLocallyAcked ? '<span class="badge" style="font-size:0.62rem; background:rgba(255,214,10,0.15); color:var(--brand-yellow);">Silenced</span>' : ''}
               </div>
             </div>
           </div>
@@ -4482,9 +4525,13 @@
               ${escapeHTML(a.status.toUpperCase())}
             </span>
 
-            ${canAct && a.status === 'open' ? `
-              <button class="btn btn-secondary btn-sm btn-ack-alert" data-id="${escapeHTML(a.id)}">Ack</button>
-            ` : ''}
+            ${a.status !== 'resolved' ? (
+              isLocallyAcked ? `
+                <button class="btn btn-secondary btn-sm btn-reset-alert" data-id="${escapeHTML(a.id)}" title="Re-arm audible alarm for this alert">Re-arm</button>
+              ` : `
+                <button class="btn btn-secondary btn-sm btn-ack-alert" data-id="${escapeHTML(a.id)}" title="Silence alarm for this alert">Ack</button>
+              `
+            ) : ''}
 
             ${canAct && a.status !== 'resolved' ? `
               <button class="btn btn-primary btn-sm btn-resolve-alert" data-id="${escapeHTML(a.id)}">Resolve</button>
@@ -4506,6 +4553,13 @@
         } catch (err) {
           showToast(`Ack failed: ${err.message}`, 'error');
         }
+      });
+    });
+
+    document.querySelectorAll('.btn-reset-alert').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        const id = e.target.getAttribute('data-id');
+        resetAlertAcknowledgement(id);
       });
     });
 
