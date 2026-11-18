@@ -552,42 +552,85 @@
   }
 
   /**
-   * Generates an industrial dual-tone siren chirp using native Web Audio API oscillators.
-   * Runs without relying on external mp3/wav assets so it works offline and instantaneously.
+   * Generates a modern acoustic alert sound using native Web Audio API oscillators and filters:
+   * - 'critical': Clean dual-pulse ISO 7731 medical/industrial sonance (880Hz / 660Hz) with smooth decay and subtle sub-harmonic warmth.
+   * - 'warning': Dual rising chime (523Hz C5 -> 659Hz E5).
+   * - 'info': Soft affirmative ping (784Hz G5).
+   * Free of harsh piercing buzzy sawtooth edges, crystal clear and pleasant yet urgent.
    */
-  function playIndustrialAlarmBeep(durationMs = 900, urgency = 'critical') {
+  function playIndustrialAlarmBeep(durationMs = 800, urgency = 'critical') {
     if (!state.soundAlertsEnabled) return;
     try {
       const ctx = getAudioContext();
       if (!ctx) return;
 
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-
-      osc.type = urgency === 'critical' ? 'sawtooth' : 'sine';
       const now = ctx.currentTime;
-      const durationSec = durationMs / 1000;
 
       if (urgency === 'critical') {
-        // High-low alternating siren wail: 880Hz down to 540Hz
-        osc.frequency.setValueAtTime(880, now);
-        osc.frequency.exponentialRampToValueAtTime(540, now + durationSec * 0.45);
-        osc.frequency.exponentialRampToValueAtTime(920, now + durationSec * 0.9);
+        // High-end acoustic double-pulse pulse sonar (Pulse A: 880Hz, Pulse B: 660Hz)
+        const playTonePulse = (freq, offsetSec, lenSec) => {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          const filter = ctx.createBiquadFilter();
+
+          // Warm lowpass filter to remove harsh digital harmonics
+          filter.type = 'lowpass';
+          filter.frequency.setValueAtTime(2400, now + offsetSec);
+
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(freq, now + offsetSec);
+          osc.frequency.exponentialRampToValueAtTime(freq * 0.96, now + offsetSec + lenSec);
+
+          // Smooth curved envelope
+          gain.gain.setValueAtTime(0.0001, now + offsetSec);
+          gain.gain.linearRampToValueAtTime(0.24, now + offsetSec + 0.025);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + offsetSec + lenSec);
+
+          osc.connect(filter);
+          filter.connect(gain);
+          gain.connect(ctx.destination);
+
+          osc.start(now + offsetSec);
+          osc.stop(now + offsetSec + lenSec + 0.05);
+        };
+
+        // Two urgent acoustic pulses in rapid succession
+        playTonePulse(880, 0.0, 0.22);
+        playTonePulse(660, 0.26, 0.28);
+
+      } else if (urgency === 'warning') {
+        // Dual-tone harmonic chime (C5 to E5, 523Hz -> 659Hz)
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(523, now);
+        osc.frequency.exponentialRampToValueAtTime(659, now + 0.35);
+
+        gain.gain.setValueAtTime(0.0001, now);
+        gain.gain.linearRampToValueAtTime(0.18, now + 0.03);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.45);
+
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.48);
+
       } else {
-        // Warning chime: 640Hz to 780Hz
-        osc.frequency.setValueAtTime(640, now);
-        osc.frequency.exponentialRampToValueAtTime(780, now + durationSec * 0.8);
+        // Gentle affirmative ping
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(784, now);
+        gain.gain.setValueAtTime(0.0001, now);
+        gain.gain.linearRampToValueAtTime(0.15, now + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.25);
+
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now);
+        osc.stop(now + 0.28);
       }
 
-      gain.gain.setValueAtTime(0.001, now);
-      gain.gain.exponentialRampToValueAtTime(0.18, now + 0.04);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + durationSec);
-
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-
-      osc.start(now);
-      osc.stop(now + durationSec + 0.05);
     } catch (e) {
       console.warn('[Audio] Could not play alert chime:', e);
     }
@@ -601,13 +644,13 @@
     if (!state.soundAlertsEnabled) return;
     if (activeSirenInterval) return; // already chiming
 
-    playIndustrialAlarmBeep(900, urgency);
+    playIndustrialAlarmBeep(800, urgency);
     activeSirenInterval = setInterval(() => {
       if (!state.soundAlertsEnabled || !state.currentActiveCriticalAlert) {
         stopSirenLoop();
         return;
       }
-      playIndustrialAlarmBeep(850, urgency);
+      playIndustrialAlarmBeep(800, urgency);
     }, 3200);
   }
 
