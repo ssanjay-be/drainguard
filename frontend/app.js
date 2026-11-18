@@ -50,7 +50,17 @@
     analyticsDays: 30,
     trendsRange: '24h',
     trendsUserPicked: false,
-    calibrationPollingId: null
+    calibrationPollingId: null,
+    soundAlertsEnabled: localStorage.getItem('drainGuard_sound_alerts') !== 'false', // Default enabled (audible alarms)
+    activeSirenAudio: null,
+    acknowledgedAlertMap: (() => {
+      try {
+        return JSON.parse(localStorage.getItem('drainGuard_acked_alerts') || '{}');
+      } catch (_) {
+        return {};
+      }
+    })(),
+    currentActiveCriticalAlert: null
   };
 
   // Registry to hold active Chart.js and Leaflet instances for safe cleanup
@@ -522,6 +532,196 @@
     if (icon) {
       icon.textContent = theme === 'dark' ? '🌙' : '☀️';
     }
+  }
+
+  // ─── Sound Alarm Engine (Web Audio API Synthesizer) ────────────────────────
+  let audioCtxInstance = null;
+  let activeSirenInterval = null;
+
+  function getAudioContext() {
+    if (!audioCtxInstance) {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (AudioCtx) {
+        audioCtxInstance = new AudioCtx();
+      }
+    }
+    if (audioCtxInstance && audioCtxInstance.state === 'suspended') {
+      audioCtxInstance.resume().catch(() => {});
+    }
+    return audioCtxInstance;
+  }
+
+  /**
+   * Generates an industrial dual-tone siren chirp using native Web Audio API oscillators.
+   * Runs without relying on external mp3/wav assets so it works offline and instantaneously.
+   */
+  function playIndustrialAlarmBeep(durationMs = 900, urgency = 'critical') {
+    if (!state.soundAlertsEnabled) return;
+    try {
+      const ctx = getAudioContext();
+      if (!ctx) return;
+
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc.type = urgency === 'critical' ? 'sawtooth' : 'sine';
+      const now = ctx.currentTime;
+      const durationSec = durationMs / 1000;
+
+      if (urgency === 'critical') {
+        // High-low alternating siren wail: 880Hz down to 540Hz
+        osc.frequency.setValueAtTime(880, now);
+        osc.frequency.exponentialRampToValueAtTime(540, now + durationSec * 0.45);
+        osc.frequency.exponentialRampToValueAtTime(920, now + durationSec * 0.9);
+      } else {
+        // Warning chime: 640Hz to 780Hz
+        osc.frequency.setValueAtTime(640, now);
+        osc.frequency.exponentialRampToValueAtTime(780, now + durationSec * 0.8);
+      }
+
+      gain.gain.setValueAtTime(0.001, now);
+      gain.gain.exponentialRampToValueAtTime(0.18, now + 0.04);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + durationSec);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+
+      osc.start(now);
+      osc.stop(now + durationSec + 0.05);
+    } catch (e) {
+      console.warn('[Audio] Could not play alert chime:', e);
+    }
+  }
+
+  /**
+   * Starts repeating siren pulse if an unacknowledged critical alert is persisting.
+   * Repeats every 3.2 seconds until acknowledged or resolved.
+   */
+  function startSirenLoop(urgency = 'critical') {
+    if (!state.soundAlertsEnabled) return;
+    if (activeSirenInterval) return; // already chiming
+
+    playIndustrialAlarmBeep(900, urgency);
+    activeSirenInterval = setInterval(() => {
+      if (!state.soundAlertsEnabled || !state.currentActiveCriticalAlert) {
+        stopSirenLoop();
+        return;
+      }
+      playIndustrialAlarmBeep(850, urgency);
+    }, 3200);
+  }
+
+  function stopSirenLoop() {
+    if (activeSirenInterval) {
+      clearInterval(activeSirenInterval);
+      activeSirenInterval = null;
+    }
+  }
+
+  /**
+   * Handles user acknowledgement for persisting alerts:
+   * Sets local acknowledged persistence timer (or marks on backend if admin)
+   */
+  async function acknowledgePersistingAlert(alertObj) {
+    if (!alertObj || !alertObj.id) return;
+    const alertId = String(alertObj.id);
+
+    // Save locally so even read-only operators can silence on their terminal
+    state.acknowledgedAlertMap[alertId] = {
+      ackedAt: Date.now(),
+      persistsUntilTime: Date.now() + 15 * 60 * 1000 // Silenced for 15 min; re-sounds only if still persisting afterwards
+    };
+    try {
+      localStorage.setItem('drainGuard_acked_alerts', JSON.stringify(state.acknowledgedAlertMap));
+    } catch (_) {}
+
+    // Silence active siren loop immediately
+    stopSirenLoop();
+
+    // If operator has admin key, also mark on backend
+    if (state.adminKey && alertObj.status === 'open') {
+      try {
+        await API.ackAlert(alertId, state.adminKey);
+      } catch (err) {
+        console.warn('[Alerts] Remote ack sync failed:', err);
+      }
+    }
+
+    showToast(`Alert #${alertId} acknowledged & silenced (will re-alert only if persistent after 15m)`, 'info', 4500);
+
+    // Refresh banner UI state
+    if (state.activeOverview && state.activeOverview.device) {
+      API.getAlerts({ device_id: state.currentDeviceId, pageSize: 50 }).then(res => {
+        const list = Array.isArray(res) ? res : (res.data || res.alerts || []);
+        checkCriticalAlerts(list);
+      }).catch(() => {});
+    }
+  }
+
+  function initSoundAlertControls() {
+    const soundBtn = document.getElementById('sound-alerts-btn');
+    const soundIcon = document.getElementById('sound-alerts-icon');
+    const soundBadge = document.getElementById('sound-alerts-badge');
+
+    const updateSoundUI = () => {
+      if (soundIcon && soundBadge && soundBtn) {
+        if (state.soundAlertsEnabled) {
+          soundIcon.textContent = '🔊';
+          soundBadge.textContent = 'Active';
+          soundBadge.className = 'badge clear';
+          soundBtn.title = 'Sound Alerts: Active (Click to mute)';
+        } else {
+          soundIcon.textContent = '🔇';
+          soundBadge.textContent = 'Muted';
+          soundBadge.className = 'badge';
+          soundBtn.title = 'Sound Alerts: Muted (Click to enable audio siren)';
+        }
+      }
+    };
+
+    updateSoundUI();
+
+    if (soundBtn) {
+      soundBtn.addEventListener('click', () => {
+        state.soundAlertsEnabled = !state.soundAlertsEnabled;
+        localStorage.setItem('drainGuard_sound_alerts', state.soundAlertsEnabled ? 'true' : 'false');
+        updateSoundUI();
+
+        if (state.soundAlertsEnabled) {
+          getAudioContext(); // prime audio context on user gesture
+          playIndustrialAlarmBeep(350, 'info'); // feedback beep
+          showToast('Audible sound alerts enabled', 'success');
+          // If critical alert is currently active and unacknowledged, start siren
+          if (state.currentActiveCriticalAlert) {
+            startSirenLoop('critical');
+          }
+        } else {
+          stopSirenLoop();
+          showToast('Sound alerts muted', 'info');
+        }
+      });
+    }
+
+    // Attach Acknowledgement button handler on the critical banner
+    const ackBtn = document.getElementById('alert-banner-ack');
+    if (ackBtn) {
+      ackBtn.addEventListener('click', () => {
+        if (state.currentActiveCriticalAlert) {
+          acknowledgePersistingAlert(state.currentActiveCriticalAlert);
+        } else {
+          stopSirenLoop();
+        }
+      });
+    }
+
+    // Unlock Web Audio context on the first click anywhere in the dashboard
+    const unlockAudio = () => {
+      getAudioContext();
+      window.removeEventListener('click', unlockAudio);
+      window.removeEventListener('keydown', unlockAudio);
+    };
+    window.addEventListener('click', unlockAudio, { once: true });
+    window.addEventListener('keydown', unlockAudio, { once: true });
   }
 
   /**
@@ -1044,12 +1244,14 @@
   }
 
   /**
-   * Scans alerts and surfaces the sticky red banner + tab counter if critical/open issues exist
+   * Scans alerts and surfaces the sticky red banner + tab counter if critical/open issues exist.
+   * Plays audible sound alerts if unacknowledged, and silences once acknowledged unless persisting past duration.
    */
   function checkCriticalAlerts(alertsList) {
     const banner = document.getElementById('alert-banner');
     const text = document.getElementById('alert-banner-text');
     const navBadge = document.getElementById('nav-alerts-badge');
+    const ackBtn = document.getElementById('alert-banner-ack');
 
     const openAlerts = alertsList.filter(a => a.status === 'open');
     if (navBadge) {
@@ -1061,26 +1263,66 @@
       }
     }
 
-    if (!banner || !text) return;
-
     const criticals = alertsList.filter(a => 
       a.status === 'open' && (a.severity === 'critical' || a.type === 'PRE_CLOG' || a.type === 'FLOOD_RISK')
     );
 
     if (criticals.length > 0) {
       const topAlert = criticals[0];
-      text.textContent = `[${topAlert.type}] ${topAlert.message} (${criticals.length} active critical issue${criticals.length > 1 ? 's' : ''})`;
-      banner.hidden = false;
+      state.currentActiveCriticalAlert = topAlert;
+      const alertId = String(topAlert.id);
+      const ackRecord = state.acknowledgedAlertMap[alertId];
+
+      const now = Date.now();
+      const isAckedAndActive = ackRecord && now < ackRecord.persistsUntilTime;
+      const isPersistingPastAck = ackRecord && now >= ackRecord.persistsUntilTime;
+
+      if (banner && text) {
+        if (isAckedAndActive) {
+          text.textContent = `[${topAlert.type}] ${topAlert.message} · Acknowledged (Persisting)`;
+          if (ackBtn) {
+            ackBtn.textContent = 'Acked (Silenced)';
+            ackBtn.disabled = true;
+            ackBtn.style.opacity = '0.7';
+          }
+        } else {
+          text.textContent = isPersistingPastAck
+            ? `⚠️ PERSISTENT: [${topAlert.type}] ${topAlert.message} (Still unresolved!)`
+            : `[${topAlert.type}] ${topAlert.message} (${criticals.length} active critical issue${criticals.length > 1 ? 's' : ''})`;
+          if (ackBtn) {
+            ackBtn.textContent = 'Silence / Ack';
+            ackBtn.disabled = false;
+            ackBtn.style.opacity = '1';
+          }
+        }
+        banner.hidden = false;
+      }
+
+      // Audio alarm logic:
+      // If NOT acknowledged OR acknowledged previously but persisting past 15 min, trigger sound siren!
+      if (!isAckedAndActive) {
+        startSirenLoop('critical');
+      } else {
+        stopSirenLoop();
+      }
+
     } else {
-      banner.hidden = true;
+      state.currentActiveCriticalAlert = null;
+      stopSirenLoop();
+      if (banner) banner.hidden = true;
     }
 
-    // Check for newly arrived alerts and show toast
+    // Check for newly arrived alerts and show toast + optional prompt beep
     alertsList.forEach(a => {
       if (a.id && !state.knownAlertIds.has(a.id)) {
         state.knownAlertIds.add(a.id);
         if (a.status === 'open') {
           showToast(`🔔 New ${a.severity.toUpperCase()} alert: ${a.message}`, a.severity === 'critical' ? 'error' : 'warning');
+          if (a.severity === 'critical') {
+            playIndustrialAlarmBeep(900, 'critical');
+          } else if (a.severity === 'warning') {
+            playIndustrialAlarmBeep(500, 'warning');
+          }
         }
       }
     });
@@ -4155,9 +4397,9 @@
     document.querySelectorAll('.btn-ack-alert').forEach(btn => {
       btn.addEventListener('click', async (e) => {
         const id = e.target.getAttribute('data-id');
+        const alertObj = alerts.find(a => String(a.id) === String(id)) || { id };
         try {
-          await API.ackAlert(id, state.adminKey);
-          showToast(`Alert #${id} acknowledged`, 'info');
+          await acknowledgePersistingAlert(alertObj);
           renderAlertsTab();
         } catch (err) {
           showToast(`Ack failed: ${err.message}`, 'error');
@@ -4169,8 +4411,18 @@
       btn.addEventListener('click', async (e) => {
         const id = e.target.getAttribute('data-id');
         try {
+          // If this resolved alert was the current active critical one, silence siren
+          if (state.currentActiveCriticalAlert && String(state.currentActiveCriticalAlert.id) === String(id)) {
+            state.currentActiveCriticalAlert = null;
+            stopSirenLoop();
+          }
+          delete state.acknowledgedAlertMap[String(id)];
+          try {
+            localStorage.setItem('drainGuard_acked_alerts', JSON.stringify(state.acknowledgedAlertMap));
+          } catch (_) {}
+
           await API.resolveAlert(id, state.adminKey);
-          showToast(`Alert #${id} resolved`, 'success');
+          showToast(`Alert #${id} resolved & cleared`, 'success');
           renderAlertsTab();
         } catch (err) {
           showToast(`Resolve failed: ${err.message}`, 'error');
@@ -4499,6 +4751,7 @@
 
   document.addEventListener('DOMContentLoaded', () => {
     initTheme();
+    initSoundAlertControls();
     initAdminAuth();
     initNavigation();
     loadInitialData();

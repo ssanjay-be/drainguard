@@ -88,6 +88,12 @@
             <span id="refresh-icon">↻</span>
           </button>
 
+          <!-- Sound Alerts Toggle Button -->
+          <button id="sound-alerts-btn" class="btn-icon" aria-label="Toggle audible alarm alerts" title="Sound Alerts: Muted (Click to enable audio siren)">
+            <span id="sound-alerts-icon">🔇</span>
+            <span id="sound-alerts-badge" class="badge">Muted</span>
+          </button>
+
           <!-- Theme Toggle (Dark Obsidian / Light Gold) -->
           <button id="theme-toggle" class="btn-icon" aria-label="Toggle dark or light theme" title="Toggle Obsidian / Daylight theme">
             <span id="theme-icon">🌙</span>
@@ -105,10 +111,13 @@
     <!-- ─── 2. Critical Alert Banner ────────────────────────────── -->
     <div id="alert-banner" hidden role="alert" aria-live="assertive">
       <div class="alert-banner-content">
-        <span>🚨</span>
+        <span class="alert-banner-pulsar">🚨</span>
         <span id="alert-banner-text">Critical clog or flood alert active on selected drain!</span>
       </div>
-      <button id="alert-banner-action" class="alert-banner-btn">View Alerts</button>
+      <div class="alert-banner-actions">
+        <button id="alert-banner-ack" class="alert-banner-btn alert-banner-btn-ack" title="Silence audio and acknowledge current persisting alert">Silence / Ack</button>
+        <button id="alert-banner-action" class="alert-banner-btn">View Alerts</button>
+      </div>
     </div>
 
     <!-- ─── 3. Cold-Start Server Wakeup Message (Hidden unless >2s) ─ -->

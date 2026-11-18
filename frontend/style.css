@@ -409,6 +409,15 @@ button, input, select, textarea {
   gap: 0.6rem;
   flex: 1;
 }
+.alert-banner-pulsar {
+  font-size: 1.1rem;
+  animation: pulse-alert-badge 1.2s infinite ease-in-out;
+}
+.alert-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
 .alert-banner-btn {
   background: rgba(0, 0, 0, 0.25);
   border: 1px solid rgba(255, 255, 255, 0.45);
@@ -418,10 +427,23 @@ button, input, select, textarea {
   cursor: pointer;
   font-size: 0.78rem;
   font-weight: 700;
-  transition: background var(--transition-fast);
+  transition: background var(--transition-fast), transform var(--transition-fast);
 }
 .alert-banner-btn:hover {
   background: rgba(255, 255, 255, 0.25);
+}
+.alert-banner-btn:active {
+  transform: scale(0.96);
+}
+.alert-banner-btn-ack {
+  background: #ffffff;
+  color: #b91c1c;
+  border-color: #ffffff;
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.35);
+}
+.alert-banner-btn-ack:hover {
+  background: #fef2f2;
+  color: #991b1b;
 }
 
 /* ─── 5. Cold-Start Server Wakeup Banner ────────────────────── */
