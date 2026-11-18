@@ -553,12 +553,12 @@
 
   /**
    * Generates a modern acoustic alert sound using native Web Audio API oscillators and filters:
-   * - 'critical': Clean dual-pulse ISO 7731 medical/industrial sonance (880Hz / 660Hz) with smooth decay and subtle sub-harmonic warmth.
+   * - 'critical': Crisp, authoritative high-low alert beep pattern (800Hz / 600Hz) with smooth acoustic envelope.
    * - 'warning': Dual rising chime (523Hz C5 -> 659Hz E5).
    * - 'info': Soft affirmative ping (784Hz G5).
    * Free of harsh piercing buzzy sawtooth edges, crystal clear and pleasant yet urgent.
    */
-  function playIndustrialAlarmBeep(durationMs = 800, urgency = 'critical') {
+  function playIndustrialAlarmBeep(urgency = 'critical') {
     if (!state.soundAlertsEnabled) return;
     try {
       const ctx = getAudioContext();
@@ -567,23 +567,20 @@
       const now = ctx.currentTime;
 
       if (urgency === 'critical') {
-        // High-end acoustic double-pulse pulse sonar (Pulse A: 880Hz, Pulse B: 660Hz)
+        // High-low alternating acoustic beep pattern
         const playTonePulse = (freq, offsetSec, lenSec) => {
           const osc = ctx.createOscillator();
           const gain = ctx.createGain();
           const filter = ctx.createBiquadFilter();
 
-          // Warm lowpass filter to remove harsh digital harmonics
           filter.type = 'lowpass';
-          filter.frequency.setValueAtTime(2400, now + offsetSec);
+          filter.frequency.setValueAtTime(2600, now + offsetSec);
 
           osc.type = 'sine';
           osc.frequency.setValueAtTime(freq, now + offsetSec);
-          osc.frequency.exponentialRampToValueAtTime(freq * 0.96, now + offsetSec + lenSec);
 
-          // Smooth curved envelope
           gain.gain.setValueAtTime(0.0001, now + offsetSec);
-          gain.gain.linearRampToValueAtTime(0.24, now + offsetSec + 0.025);
+          gain.gain.linearRampToValueAtTime(0.26, now + offsetSec + 0.02);
           gain.gain.exponentialRampToValueAtTime(0.0001, now + offsetSec + lenSec);
 
           osc.connect(filter);
@@ -591,12 +588,12 @@
           gain.connect(ctx.destination);
 
           osc.start(now + offsetSec);
-          osc.stop(now + offsetSec + lenSec + 0.05);
+          osc.stop(now + offsetSec + lenSec + 0.04);
         };
 
-        // Two urgent acoustic pulses in rapid succession
-        playTonePulse(880, 0.0, 0.22);
-        playTonePulse(660, 0.26, 0.28);
+        // Two crisp beeps: 820Hz then 620Hz
+        playTonePulse(820, 0.0, 0.16);
+        playTonePulse(620, 0.20, 0.18);
 
       } else if (urgency === 'warning') {
         // Dual-tone harmonic chime (C5 to E5, 523Hz -> 659Hz)
@@ -637,27 +634,42 @@
   }
 
   /**
-   * Starts repeating siren pulse if an unacknowledged critical alert is persisting.
-   * Repeats every 3.2 seconds until acknowledged or resolved.
+   * Starts repeating beep alarm when a critical alert arrives or persists.
+   * Plays rhythmic beep bursts for a total of 10 SECONDS per alarm cycle.
+   * If acknowledged or muted at any time during the 10s, stops instantly.
    */
+  let sirenCycleTimeoutId = null;
+
   function startSirenLoop(urgency = 'critical') {
     if (!state.soundAlertsEnabled) return;
-    if (activeSirenInterval) return; // already chiming
+    if (activeSirenInterval) return; // already in active 10s cycle
 
-    playIndustrialAlarmBeep(800, urgency);
+    // Play first beep immediately
+    playIndustrialAlarmBeep(urgency);
+
+    // Beep cadence: every 700ms for 10 seconds (approx 14 beep pulses total)
     activeSirenInterval = setInterval(() => {
       if (!state.soundAlertsEnabled || !state.currentActiveCriticalAlert) {
         stopSirenLoop();
         return;
       }
-      playIndustrialAlarmBeep(800, urgency);
-    }, 3200);
+      playIndustrialAlarmBeep(urgency);
+    }, 700);
+
+    // Hard stop this alarm burst after exactly 10 SECONDS (10000ms)
+    sirenCycleTimeoutId = setTimeout(() => {
+      stopSirenLoop();
+    }, 10000);
   }
 
   function stopSirenLoop() {
     if (activeSirenInterval) {
       clearInterval(activeSirenInterval);
       activeSirenInterval = null;
+    }
+    if (sirenCycleTimeoutId) {
+      clearTimeout(sirenCycleTimeoutId);
+      sirenCycleTimeoutId = null;
     }
   }
 
@@ -1362,9 +1374,9 @@
         if (a.status === 'open') {
           showToast(`🔔 New ${a.severity.toUpperCase()} alert: ${a.message}`, a.severity === 'critical' ? 'error' : 'warning');
           if (a.severity === 'critical') {
-            playIndustrialAlarmBeep(900, 'critical');
+            startSirenLoop('critical');
           } else if (a.severity === 'warning') {
-            playIndustrialAlarmBeep(500, 'warning');
+            playIndustrialAlarmBeep('warning');
           }
         }
       }
