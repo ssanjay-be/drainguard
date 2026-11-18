@@ -970,10 +970,25 @@ button, input, select, textarea {
 }
 
 /* ─── 12. Drain Tank Visual (Black & Yellow Enclosure Aesthetic) ─ */
+#card-drain-tank {
+  display: flex;
+  flex-direction: column;
+}
+
+#card-drain-tank #tank-visual-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
 .drain-tank-wrapper {
   display: flex;
   flex-direction: column;
   align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  height: 100%;
 }
 
 .drain-tank-container {
@@ -982,12 +997,13 @@ button, input, select, textarea {
   justify-content: center;
   gap: 0.75rem;
   width: 100%;
-  max-width: 260px;
-  margin: 0.25rem auto 1.1rem;
+  max-width: 270px;
+  margin: 0.5rem auto 1.5rem;
+  flex: 1;
 }
 
 .tank-ruler {
-  height: 224px;
+  height: 260px;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
@@ -1000,8 +1016,8 @@ button, input, select, textarea {
 }
 
 .drain-tank {
-  width: 164px;
-  height: 224px;
+  width: 176px;
+  height: 260px;
   background: linear-gradient(180deg, rgba(12, 12, 16, 0.92) 0%, rgba(24, 24, 30, 0.96) 100%);
   border: 3px solid #2b2b33;
   border-top: none;
@@ -1137,11 +1153,12 @@ button, input, select, textarea {
   grid-template-columns: 1fr 1fr;
   gap: 0.5rem;
   background: var(--surface-subtle);
-  padding: 0.85rem;
+  padding: 0.95rem 0.85rem;
   border-radius: var(--radius-md);
   font-size: 0.78rem;
   text-align: center;
   border: 1px solid var(--border-color);
+  margin-top: auto;
 }
 .tank-metric-val {
   font-weight: 800;
