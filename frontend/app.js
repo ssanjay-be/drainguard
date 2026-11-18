@@ -552,11 +552,45 @@
   }
 
   /**
-   * Generates a modern acoustic alert sound using native Web Audio API oscillators and filters:
-   * - 'critical': Crisp, authoritative high-low alert beep pattern (800Hz / 600Hz) with smooth acoustic envelope.
-   * - 'warning': Dual rising chime (523Hz C5 -> 659Hz E5).
-   * - 'info': Soft affirmative ping (784Hz G5).
-   * Free of harsh piercing buzzy sawtooth edges, crystal clear and pleasant yet urgent.
+   * Calculates the current water level severity ratio (0.0 to 1.0+) based on physical sensor geometry:
+   * 0.0 = completely dry / safe baseline
+   * 0.5 = reaching rain/watch threshold
+   * 1.0 = at or exceeding flood warning / sensor brim capacity (Emergency)
+   */
+  function getCurrentWaterSeverityRatio() {
+    try {
+      const overview = state.activeOverview;
+      const reading = (overview && overview.reading) || {};
+      const config = (overview && overview.config) || {};
+
+      const currentWater = Number(reading.water_cm || 0);
+      const sensorToBottom = Number(config.sensor_to_bottom_cm || 60);
+      const rainStart = Number(config.rain_start_cm || 10);
+      const floodThreshold = sensorToBottom * 0.75; // 75% depth = flood warning level
+
+      if (currentWater <= 0) return 0.0;
+      if (currentWater <= rainStart) {
+        return Math.max(0.05, (currentWater / rainStart) * 0.35);
+      }
+      // Between rain start and flood warning
+      if (currentWater < floodThreshold) {
+        const range = floodThreshold - rainStart;
+        const norm = (currentWater - rainStart) / (range || 1);
+        return 0.35 + norm * 0.45; // 0.35 to 0.80
+      }
+      // At or above flood warning (Emergency)
+      const excess = (currentWater - floodThreshold) / ((sensorToBottom - floodThreshold) || 1);
+      return Math.min(1.0, 0.80 + Math.max(0, excess) * 0.20);
+    } catch (_) {
+      return 0.5;
+    }
+  }
+
+  /**
+   * Generates a dynamic ECG-style acoustic alert beep whose:
+   * 1. Frequency (Pitch): scales from 580Hz (low water/safe) up to 1100Hz (emergency high water).
+   * 2. Intensity (Volume & Filter): scales from gentle warm ping to razor-sharp urgent acoustic pulse.
+   * 3. Pulse Cadence: ECG monitor style blip with instant acoustic attack and smooth natural body.
    */
   function playIndustrialAlarmBeep(urgency = 'critical') {
     if (!state.soundAlertsEnabled) return;
@@ -565,35 +599,39 @@
       if (!ctx) return;
 
       const now = ctx.currentTime;
+      const waterRatio = getCurrentWaterSeverityRatio(); // 0.0 (low) to 1.0 (emergency)
 
       if (urgency === 'critical') {
-        // High-low alternating acoustic beep pattern
-        const playTonePulse = (freq, offsetSec, lenSec) => {
-          const osc = ctx.createOscillator();
-          const gain = ctx.createGain();
-          const filter = ctx.createBiquadFilter();
+        // Dynamic ECG-style monitor pulse:
+        // Low water / minor issue: 640Hz, soft volume (0.16)
+        // High water / Emergency: 1100Hz, high volume (0.32), brighter acoustic filter
+        const baseFreq = 640 + waterRatio * 460; // 640Hz to 1100Hz
+        const volume = 0.16 + waterRatio * 0.16;  // 0.16 to 0.32
+        const filterCutoff = 2200 + waterRatio * 2000; // 2200Hz to 4200Hz
+        const pulseLen = Math.max(0.08, 0.15 - waterRatio * 0.05); // shorter, sharper blips as it gets critical
 
-          filter.type = 'lowpass';
-          filter.frequency.setValueAtTime(2600, now + offsetSec);
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        const filter = ctx.createBiquadFilter();
 
-          osc.type = 'sine';
-          osc.frequency.setValueAtTime(freq, now + offsetSec);
+        filter.type = 'lowpass';
+        filter.frequency.setValueAtTime(filterCutoff, now);
 
-          gain.gain.setValueAtTime(0.0001, now + offsetSec);
-          gain.gain.linearRampToValueAtTime(0.26, now + offsetSec + 0.02);
-          gain.gain.exponentialRampToValueAtTime(0.0001, now + offsetSec + lenSec);
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(baseFreq, now);
+        // Slight downward pitch inflection (classic medical ECG monitor characteristic)
+        osc.frequency.exponentialRampToValueAtTime(baseFreq * 0.94, now + pulseLen);
 
-          osc.connect(filter);
-          filter.connect(gain);
-          gain.connect(ctx.destination);
+        gain.gain.setValueAtTime(0.0001, now);
+        gain.gain.linearRampToValueAtTime(volume, now + 0.012);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + pulseLen);
 
-          osc.start(now + offsetSec);
-          osc.stop(now + offsetSec + lenSec + 0.04);
-        };
+        osc.connect(filter);
+        filter.connect(gain);
+        gain.connect(ctx.destination);
 
-        // Two crisp beeps: 820Hz then 620Hz
-        playTonePulse(820, 0.0, 0.16);
-        playTonePulse(620, 0.20, 0.18);
+        osc.start(now);
+        osc.stop(now + pulseLen + 0.03);
 
       } else if (urgency === 'warning') {
         // Dual-tone harmonic chime (C5 to E5, 523Hz -> 659Hz)
@@ -635,8 +673,12 @@
 
   /**
    * Starts repeating beep alarm when a critical alert arrives or persists.
-   * Plays rhythmic beep bursts for a total of 10 SECONDS per alarm cycle.
-   * If acknowledged or muted at any time during the 10s, stops instantly.
+   * ECG Monitor behavior:
+   * - Frequency of beeps (Rate / Tempo): scales directly with water level.
+   *   Low/moderate water = relaxed 1200ms interval (50 BPM)
+   *   Emergency flood level = rapid 320ms interval (188 BPM tachycardia alarm)
+   * - Intensity & Pitch: automatically driven by getCurrentWaterSeverityRatio()
+   * Runs for 10 SECONDS per alarm cycle.
    */
   let sirenCycleTimeoutId = null;
 
@@ -644,17 +686,22 @@
     if (!state.soundAlertsEnabled) return;
     if (activeSirenInterval) return; // already in active 10s cycle
 
-    // Play first beep immediately
+    // Play first blip immediately
     playIndustrialAlarmBeep(urgency);
 
-    // Beep cadence: every 700ms for 10 seconds (approx 14 beep pulses total)
+    // Compute ECG interval based on current water level severity:
+    // 0.0 (low water) = 1200ms between beeps
+    // 1.0 (emergency flood) = 320ms between beeps
+    const waterRatio = getCurrentWaterSeverityRatio();
+    const ecgIntervalMs = Math.round(1200 - waterRatio * 880); // 1200ms down to 320ms
+
     activeSirenInterval = setInterval(() => {
       if (!state.soundAlertsEnabled || !state.currentActiveCriticalAlert) {
         stopSirenLoop();
         return;
       }
       playIndustrialAlarmBeep(urgency);
-    }, 700);
+    }, ecgIntervalMs);
 
     // Hard stop this alarm burst after exactly 10 SECONDS (10000ms)
     sirenCycleTimeoutId = setTimeout(() => {
